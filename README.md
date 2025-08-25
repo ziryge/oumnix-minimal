@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Oumnix AI – Proprietary Non‑Transformer Architecture
 
 [![License](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
