@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+from utils.logging_utils import get_logger
+from utils.metrics import MovingAverage, Timer, PerfTracker
+
+# Global perf tracker for OMNX exporter
+PERF_EXPORT = PerfTracker(window=100)
+from utils.omnx_exporter import start_omnx_exporter
+from memory.persistence import PersistenceManager
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -17,6 +24,31 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.oumnix_ai import create_oumnix_ai, OumnixAIConfig
 from utils.dataset import TextLineDataset
 from utils.tokenizer import tokenizer
+from utils.seeds import set_seed
+
+def _init_weights(m):
+    import torch
+    import torch.nn as nn
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Embedding):
+        nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+def _param_groups(model, weight_decay: float):
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.endswith('.bias') or 'norm' in n.lower() or 'layernorm' in n.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 def collate_fn(batch):
@@ -90,11 +122,15 @@ def compute_loss(model, batch, device, use_amp=False):
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, scaler, device, epoch, args):
+    logger = get_logger("train")
     model.train()
     total_loss = 0.0
     num_batches = len(dataloader)
 
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    step_timer = Timer()
+    step_timer.start()
+    perf = PerfTracker(window=100)
 
     for step, batch in enumerate(progress_bar):
         loss, logits = compute_loss(model, batch, device, args.use_amp)
@@ -130,22 +166,70 @@ def train_epoch(model, dataloader, optimizer, scheduler, scaler, device, epoch, 
         })
 
         if (step + 1) % args.log_interval == 0:
-            print(f"Epoch {epoch} | Step {step+1}/{num_batches} | "
-                  f"Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+            dt = step_timer.stop()
+            step_timer.start()
+            tokens = args.batch_size * args.max_seq_len * args.log_interval
+            # Aggregate attention metrics if present on model
+            kv_hit = 0.0
+            head_drop = 0.0
+            n = 0
+            try:
+                core = getattr(model, 'core_model', None)
+                layers_src = None
+                if core is not None and hasattr(core, 'layers'):
+                    layers_src = core.layers
+                elif hasattr(model, 'layers'):
+                    layers_src = model.layers
+                if layers_src is not None:
+                    for layer in layers_src:
+                        try:
+                            att = layer[0]
+                            if hasattr(att, 'last_kv_hit') and hasattr(att, 'last_head_drop'):
+                                kv_hit += float(att.last_kv_hit)
+                                head_drop += float(att.last_head_drop)
+                                n += 1
+                        except Exception:
+                            continue
+                if n > 0:
+                    kv_hit /= n
+                    head_drop /= n
+            except Exception:
+                pass
+            perf.update(tokens=tokens, seconds=dt, kv_hit=kv_hit, head_drop=head_drop)
+            PERF_EXPORT.update(tokens=tokens, seconds=dt, kv_hit=kv_hit, head_drop=head_drop)
+            snap = perf.snapshot()
+            logger.info(f"Epoch {epoch} | Step {step+1}/{num_batches} | Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e} | ms/token: {snap['ms_per_token']:.3f} | tokens/s: {snap['tokens_per_sec']:.1f} | vram_gb: {snap['vram_gb']:.2f}")
 
     return total_loss / num_batches
 
 
+def evaluate(model, dataloader, device, args):
+    model.eval()
+    losses = []
+    with torch.inference_mode():
+        for batch in dataloader:
+            loss, _ = compute_loss(model, batch, device, args.use_amp)
+            losses.append(loss.item())
+    return sum(losses) / max(len(losses), 1)
+
+
 def train(args):
+    logger = get_logger("train")
+    # OMNX exporter
+    omnx_thread = start_omnx_exporter(lambda: PERF_EXPORT.snapshot(), port=None)
+    # Persistence manager
+    pm = None
+    if args.save_full_state or args.resume_full_state:
+        pm = PersistenceManager(base_dir=args.state_dir, password=args.state_password)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print("Starting Oumnix Agent Training")
-    print(f"   Device: {device}")
-    print(f"   Vocabulary: {tokenizer.vocab_size} tokens")
-    print(f"   Model: {args.dim}d, {args.n_layers} layers")
-    print(f"   Mixed Precision: {args.use_amp}")
+    logger.info("Starting Oumnix Agent Training")
+    logger.info(f"Device: {device}")
+    logger.info(f"Vocabulary: {tokenizer.vocab_size} tokens")
+    logger.info(f"Model: {args.dim}d, {args.n_layers} layers")
+    logger.info(f"Mixed Precision: {args.use_amp}")
 
     dataset = TextLineDataset(dataset_dir=os.path.join(PROJECT_ROOT, 'datasets'))
-    print(f"   Dataset: {len(dataset)} samples")
+    logger.info(f"Dataset: {len(dataset)} samples")
 
     dataloader = DataLoader(
         dataset,
@@ -154,6 +238,15 @@ def train(args):
         collate_fn=collate_fn,
         num_workers=args.num_workers,
         pin_memory=True if device.type == 'cuda' else False
+    )
+
+    val_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False
     )
 
     config = OumnixAIConfig(
@@ -178,15 +271,18 @@ def train(args):
 
     model = create_oumnix_ai(config)
     model = model.to(device)
+    try:
+        model.apply(_init_weights)
+    except Exception:
+        pass
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"   Trainable parameters: {total_params/1e6:.1f}M")
+    logger.info(f"Trainable parameters: {total_params/1e6:.1f}M")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        _param_groups(model, args.weight_decay),
         lr=args.lr,
         betas=(0.9, 0.95),
-        weight_decay=args.weight_decay,
         eps=1e-8
     )
 
@@ -203,15 +299,45 @@ def train(args):
             anneal_strategy='cos'
         )
     except Exception as e:
-        print(f"[WARN] OneCycleLR scheduler not available ({e}); continuing without scheduler")
+        logger.warning(f"OneCycleLR scheduler not available ({e}); using linear warmup then constant LR")
+        warmup_steps = max(1, int(0.1 * total_steps))
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            return 1.0
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     scaler = GradScaler() if args.use_amp else None
 
-    print(f"   Total steps: {total_steps}")
-    print(f"   Warmup steps: {warmup_steps}")
-    print("=" * 60)
+    logger.info(f"Total steps: {total_steps}")
+    logger.info(f"Warmup steps: {warmup_steps}")
+    logger.info("=" * 60)
 
     best_loss = float('inf')
+    patience = getattr(args, 'early_stop_patience', 0)
+    bad_epochs = 0
+
+    # Resume full state if requested
+    if args.resume_full_state and pm is not None:
+        try:
+            state = pm.load_complete_state()
+            model.load_state_dict(state['model_weights'])
+            # Restore memory systems if present
+            try:
+                mem_state = state.get('memory_state') or {}
+                if 'infinity_window' in mem_state and hasattr(model, 'memory_system'):
+                    model.memory_system = mem_state['infinity_window']
+            except Exception:
+                logger.warning("Failed to restore memory state; continuing")
+            if state.get('optimizer_state'):
+                optimizer.load_state_dict(state['optimizer_state'])
+            if state.get('scheduler_state') and scheduler is not None:
+                scheduler.load_state_dict(state['scheduler_state'])
+            if state.get('scaler_state') and scaler is not None:
+                scaler.load_state_dict(state['scaler_state'])
+            logger.info("Resumed full state from LifeFile")
+        except Exception as e:
+            logger.warning(f"Failed to resume full state: {e}")
 
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
@@ -222,10 +348,13 @@ def train(args):
 
         epoch_time = time.time() - start_time
 
-        print(f"\nEpoch {epoch} completed")
-        print(f"   Average loss: {avg_loss:.4f}")
-        print(f"   Time: {epoch_time:.1f}s")
-        print(f"   Tokens/s: {len(dataset) * args.max_seq_len / epoch_time:.0f}")
+        logger.info(f"Epoch {epoch} completed")
+        logger.info(f"Average loss: {avg_loss:.4f}")
+        logger.info(f"Time: {epoch_time:.1f}s")
+        logger.info(f"Tokens/s: {len(dataset) * args.max_seq_len / max(epoch_time,1e-6):.0f}")
+
+        val_loss = evaluate(model, val_loader, device, args)
+        logger.info(f"Validation loss: {val_loss:.4f}")
 
         checkpoint = {
             'epoch': epoch,
@@ -239,24 +368,65 @@ def train(args):
         }
 
         ckpt_path = os.path.join(args.out_dir, f"checkpoint_epoch_{epoch}.pt")
-        torch.save(checkpoint, ckpt_path)
-        print(f"   Checkpoint saved: {ckpt_path}")
+        tmp_ckpt = ckpt_path + ".tmp"
+        torch.save(checkpoint, tmp_ckpt)
+        os.replace(tmp_ckpt, ckpt_path)
+        logger.info(f"Checkpoint saved: {ckpt_path}")
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # Save full state via PersistenceManager
+        if args.save_full_state and pm is not None:
+            try:
+                mem_state = {}
+                try:
+                    if hasattr(model, 'memory_system'):
+                        mem_state['infinity_window'] = model.memory_system
+                except Exception:
+                    pass
+                pm.save_complete_state(
+                    model_state=model.state_dict(),
+                    memory_state=mem_state,
+                    neuro_state={},
+                    metacognition_state={},
+                    config={
+                        'dim': args.dim,
+                        'n_layers': args.n_layers,
+                        'n_heads': args.n_heads,
+                        'max_seq_len': args.max_seq_len,
+                        'lr': args.lr,
+                    },
+                    optimizer_state=optimizer.state_dict(),
+                    scheduler_state=scheduler.state_dict() if scheduler else None,
+                    scaler_state=scaler.state_dict() if scaler else None,
+                )
+                logger.info("Full agent state saved to LifeFile")
+            except Exception as e:
+                logger.warning(f"Failed to save full state: {e}")
+
+        improved = val_loss < best_loss
+        if improved:
+            best_loss = val_loss
             best_path = os.path.join(args.out_dir, "best_model.pt")
-            torch.save(checkpoint, best_path)
-            print(f"   New best model: {best_path}")
+            tmp_best = best_path + ".tmp"
+            torch.save(checkpoint, tmp_best)
+            os.replace(tmp_best, best_path)
+            logger.info(f"New best model: {best_path}")
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if patience > 0 and bad_epochs >= patience:
+                logger.info("Early stopping triggered")
+                break
 
         print("-" * 60)
 
     print("Training finished")
-    print(f"   Best loss: {best_loss:.4f}")
+    print(f"   Best val loss: {best_loss:.4f}")
     print(f"   Checkpoints saved in: {args.out_dir}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Oumnix Agent Training")
+    parser.add_argument('--deterministic', action='store_true', help='Enable deterministic mode')
 
     parser.add_argument('--dim', type=int, default=768, help='Model dimension')
     parser.add_argument('--n_layers', type=int, default=12, help='Number of layers')
@@ -275,14 +445,26 @@ def main():
 
     parser.add_argument('--log_interval', type=int, default=100, help='Log interval')
     parser.add_argument('--out_dir', type=str, default='checkpoints', help='Output directory')
+    parser.add_argument('--early_stop_patience', type=int, default=0, help='Early stopping patience (0 disables)')
+
+    # Persistence flags
+    parser.add_argument('--save-full-state', dest='save_full_state', action='store_true', help='Save full agent state to LifeFile after each epoch')
+    parser.add_argument('--resume-full-state', dest='resume_full_state', action='store_true', help='Resume training from LifeFile state')
+    parser.add_argument('--state-dir', dest='state_dir', type=str, default='.ai_state', help='Directory for LifeFile persistence')
+    parser.add_argument('--state-password', dest='state_password', type=str, default=os.environ.get('OUMNIX_STATE_PASSWORD', ''), help='Password for LifeFile encryption')
 
     args = parser.parse_args()
 
+    set_seed(1337, deterministic=args.deterministic)
+
     os.makedirs(args.out_dir, exist_ok=True)
 
-    with open(os.path.join(args.out_dir, 'train_config.txt'), 'w') as f:
+    tmp_path = os.path.join(args.out_dir, 'train_config.txt.tmp')
+    final_path = os.path.join(args.out_dir, 'train_config.txt')
+    with open(tmp_path, 'w') as f:
         for arg, value in vars(args).items():
             f.write(f"{arg}: {value}\n")
+    os.replace(tmp_path, final_path)
 
     train(args)
 

@@ -1,13 +1,13 @@
 """
 """
-import math
+# import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, List
-import numpy as np
+# import numpy as np
 from dataclasses import dataclass
-from collections import defaultdict
+# from collections import defaultdict
 
 @dataclass
 class OumnixMinimalConfig:
@@ -230,6 +230,10 @@ class LocalGlobalAttention(nn.Module):
         self.identity_head = nn.Linear(self.head_dim, 64)  
         self.citation_head = nn.Linear(self.head_dim, 32)  
         
+        # OMNX deep metrics holders
+        self.last_kv_hit: float = 0.0
+        self.last_head_drop: float = 0.0
+        
     def forward(self, x: torch.Tensor, 
                 kv_cache: Optional[Dict] = None,
                 memory_vectors: Optional[torch.Tensor] = None,
@@ -256,6 +260,18 @@ class LocalGlobalAttention(nn.Module):
         
         
         combined = local_attn + global_attn + rag_attn
+        # OMNX deep metrics: kv hit (rag mass ratio) and head drop (heads with low max)
+        try:
+            if memory_vectors is not None and memory_vectors.numel() > 0:
+                mass_mem = rag_attn.abs().sum().item()
+                mass_all = (local_attn.abs().sum() + global_attn.abs().sum() + rag_attn.abs().sum()).item()
+                self.last_kv_hit = float(mass_mem / max(mass_all, 1e-12))
+            else:
+                self.last_kv_hit = 0.0
+            max_attn = combined.amax(dim=-1)  # [B,H,N]
+            self.last_head_drop = float((max_attn < 0.5).float().mean().item())
+        except Exception:
+            pass
         
         
         last_head = combined[:, 0, :, :]

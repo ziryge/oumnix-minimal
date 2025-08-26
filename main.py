@@ -1,9 +1,12 @@
 import argparse
+import os
+from utils.seeds import set_seed
 import sys
 import os
 import signal
-from pathlib import Path
+# from pathlib import Path
 import torch
+from utils.logging_utils import get_logger
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 if PROJECT_ROOT not in sys.path:
@@ -15,7 +18,8 @@ from utils.tokenizer import tokenizer
 ai_instance = None
 
 def signal_handler(signum, frame):
-    print("\n[INTERRUPTED] Interrupt signal received...")
+    logger = get_logger("main")
+    logger.info("Interrupt signal received...")
     if ai_instance:
         ai_instance.deactivate()
     sys.exit(0)
@@ -90,11 +94,15 @@ def main():
     )
     
     args = parser.parse_args()
+
+    # Deterministic seeding (env toggle)
+    set_seed(1337, deterministic=(os.environ.get("OUMNIX_DETERMINISTIC", "0") == "1"))
     
-    print("[INFO] Initializing oumnix agent...")
-    print(f"   Vocabulary: {tokenizer.vocab_size} tokens")
-    print(f"   Model: {args.model_dim}d, {args.layers} layers")
-    print(f"   State directory: {args.state_dir}")
+    logger = get_logger("main")
+    logger.info("Initializing oumnix agent...")
+    logger.info(f"Vocabulary: {tokenizer.vocab_size} tokens")
+    logger.info(f"Model: {args.model_dim}d, {args.layers} layers")
+    logger.info(f"State directory: {args.state_dir}")
     
     try:
         ckpt_to_load = None
@@ -108,7 +116,7 @@ def main():
                     args.n_heads = int(ckpt_args.get('n_heads', args.n_heads))
                     print(f"[CONFIG] Aligning config to checkpoint: {args.model_dim}d, {args.layers} layers, {args.n_heads} heads")
             except Exception as e:
-                print(f"[WARN] Could not inspect checkpoint: {e}")
+                logger.warning(f"Could not inspect checkpoint: {e}")
         else:
             candidate_dirs = [
                 os.path.join(PROJECT_ROOT, 'checkpo'),
@@ -146,15 +154,15 @@ def main():
                 try:
                     ckpt_to_load = torch.load(auto_path, map_location='cpu')
                     args.checkpoint_path = auto_path
-                    print(f"[SCAN] Automatically detected checkpoint: {auto_path}")
+                    logger.info(f"Automatically detected checkpoint: {auto_path}")
                     if args.align_config_from_checkpoint and isinstance(ckpt_to_load, dict):
                         ckpt_args = ckpt_to_load.get('args') or {}
                         args.model_dim = int(ckpt_args.get('dim', args.model_dim))
                         args.layers = int(ckpt_args.get('n_layers', args.layers))
                         args.n_heads = int(ckpt_args.get('n_heads', args.n_heads))
-                        print(f"[CONFIG] Aligning config to checkpoint: {args.model_dim}d, {args.layers} layers, {args.n_heads} heads")
+                        logger.info(f"Aligning config to checkpoint: {args.model_dim}d, {args.layers} layers, {args.n_heads} heads")
                 except Exception as e:
-                    print(f"[WARN] Failed to load detected checkpoint: {e}")
+                    logger.warning(f"Failed to load detected checkpoint: {e}")
 
         config = OumnixAIConfig(
             vocab_size=tokenizer.vocab_size,
@@ -173,25 +181,25 @@ def main():
             try:
                 state = ckpt_to_load.get('model_state_dict', ckpt_to_load)
                 missing, unexpected = ai_instance.core_model.load_state_dict(state, strict=False)
-                print(f"[LOAD] Checkpoint loaded: {args.checkpoint_path}")
+                logger.info(f"Checkpoint loaded: {args.checkpoint_path}")
                 if missing:
-                    print(f"   [WARN] Missing {len(missing)} keys")
+                    logger.warning(f"Missing {len(missing)} keys")
                 if unexpected:
-                    print(f"   [WARN] {len(unexpected)} unexpected keys")
+                    logger.warning(f"{len(unexpected)} unexpected keys")
             except Exception as e:
-                print(f"[WARN] Failed to load checkpoint: {e}")
+                logger.warning(f"Failed to load checkpoint: {e}")
         
         if args.load_state:
-            print("[INFO] Trying to load previous state...")
+            logger.info("Trying to load previous state...")
             if ai_instance.load_state():
-                print("[OK] State loaded successfully")
+                logger.info("State loaded successfully")
             else:
-                print("[WARN] Could not load state, starting from scratch")
+                logger.warning("Could not load state, starting from scratch")
         
         ai_instance.activate()
         
         status = ai_instance.get_system_status()
-        print(f"[STATUS] {status['model_params']/1e6:.1f}M parameters, {status['background_threads']} active threads")
+        logger.info(f"Status: {status['model_params']/1e6:.1f}M parameters, {status['background_threads']} active threads")
         
         if args.ui == "cli":
             try:
@@ -199,7 +207,7 @@ def main():
                 start_advanced_cli(ai_instance)
             except ImportError:
                 from ui.cli import chat
-                print("[WARN] Using simple CLI (advanced_cli not available)")
+                logger.warning("Using simple CLI (advanced_cli not available)")
                 chat()
         else:
             try:
@@ -207,19 +215,19 @@ def main():
                 start_advanced_web(ai_instance)
             except ImportError:
                 from ui.web import chat_interface
-                print("[WARN] Using simple web interface (advanced_web not available)")
+                logger.warning("Using simple web interface (advanced_web not available)")
                 chat_interface.launch()
             
     except KeyboardInterrupt:
-        print("\n[INTERRUPTED] User interrupted")
+        logger.info("User interrupted")
     except Exception as e:
-        print(f"[FATAL] {e}")
+        logger.error(f"Fatal: {e}")
         import traceback
         traceback.print_exc()
     finally:
         if ai_instance:
             ai_instance.deactivate()
-        print("[BYE] oumnix agent terminated")
+        logger.info("oumnix agent terminated")
 
 if __name__ == "__main__":
     main()

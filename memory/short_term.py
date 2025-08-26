@@ -3,8 +3,8 @@
 import torch
 
 class ShortTermBuffer:
-    def __init__(self, capacity_tokens: int = 120_000):
-        self.capacity = capacity_tokens
+    def __init__(self, capacity_tokens: int = 120_000, max_length: int | None = None):
+        self.capacity = capacity_tokens if max_length is None else int(max_length)
         self.tokens = []  
         self.embeds = []  
 

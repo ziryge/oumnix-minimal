@@ -17,41 +17,39 @@ from collections import defaultdict, deque
 class MemoryConfig:
     """
 """
-    
     hot_kv_size: int = 4096
-    hot_kv_precision: str = "fp8"  
-    
-    
+    hot_kv_precision: str = "fp8"
     warm_window_size: int = 1024
     warm_max_windows: int = 32
     pq_clusters: int = 256
     lowrank_dim: int = 64
-    
-    
     tree_fanout: int = 8
     tree_max_depth: int = 6
     svo_max_length: int = 128
-    
-    
     max_anchors: int = 8
     anchor_fetch_size: int = 128
-    
-    
+    anchor_similarity_threshold: float = 0.0
     memory_dir: str = ".memory"
     compression_level: int = 6
+    # Eviction weights
+    eviction_alpha: float = 0.7  # time penalty weight
+    eviction_beta: float = 0.3   # importance complement weight
 
 class ProductQuantizer:
     """
 """
-    def __init__(self, dim: int, n_clusters: int = 256, n_subvectors: int = 8):
+    def __init__(self, dim: int, n_clusters: int = 256, n_subvectors: int = 8, seed: int = 1337):
         self.dim = dim
         self.n_clusters = n_clusters
         self.n_subvectors = n_subvectors
         self.subvector_dim = dim // n_subvectors
-        
-        
+        self.seed = seed
+        # Codebooks per subvector
         self.codebooks = []
         self.is_trained = False
+        # incremental training buffers
+        self._buffer = []  # type: List[np.ndarray]
+        self._buffer_limit = 8192
         
     def train(self, vectors: np.ndarray):
         """
@@ -66,11 +64,27 @@ class ProductQuantizer:
             subvectors = vectors[:, start_idx:end_idx]
             
             
-            kmeans = faiss.Kmeans(self.subvector_dim, self.n_clusters)
+            k = max(1, min(self.n_clusters, subvectors.shape[0]))
+            kmeans = faiss.Kmeans(self.subvector_dim, k)
+            try:
+                kmeans.seed = int(self.seed)
+            except Exception:
+                pass
             kmeans.train(subvectors.astype('float32'))
             self.codebooks.append(kmeans.centroids)
         
         self.is_trained = True
+        self._buffer.clear()
+
+    def partial_fit(self, vectors: np.ndarray):
+        """Incremental update: accumulate and retrain when buffer exceeds limit."""
+        if vectors.size == 0:
+            return
+        self._buffer.append(vectors.reshape(-1, self.dim))
+        total = sum(arr.shape[0] for arr in self._buffer)
+        if total >= self._buffer_limit or not self.is_trained:
+            data = np.concatenate(self._buffer, axis=0)
+            self.train(data)
     
     def encode(self, vectors: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
         """
@@ -379,15 +393,17 @@ class TeleportAttention(nn.Module):
         
         
         self.scratch_size = config.anchor_fetch_size
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        dtype = torch.float16 if dev == 'cuda' else torch.float32
         self.scratch_k = torch.zeros(
             (n_heads, self.scratch_size, self.head_dim),
-            dtype=torch.float16,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
+            dtype=dtype,
+            device=dev
         )
         self.scratch_v = torch.zeros(
             (n_heads, self.scratch_size, self.head_dim),
-            dtype=torch.float16,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
+            dtype=dtype,
+            device=dev
         )
     
     def select_anchors(self, query: torch.Tensor, 
@@ -411,7 +427,10 @@ class TeleportAttention(nn.Module):
         
         
         candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[:max_anchors]
+        # Apply similarity threshold and cap
+        thr = getattr(self.config, 'anchor_similarity_threshold', 0.0)
+        filtered = [(n, s) for (n, s) in candidates if s >= thr]
+        return filtered[:max_anchors]
     
     def fetch_mini_kv(self, anchor_node: ContextTreeNode,
                      warm_kv_storage: Dict[str, WarmKVWindow]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -438,10 +457,11 @@ class TeleportAttention(nn.Module):
         v_tensor = torch.from_numpy(v_decompressed).to(self.scratch_v.device)
         
         
-        seq_len = k_tensor.shape[0]
-        k_tensor = k_tensor.view(seq_len, self.n_heads, self.head_dim).transpose(0, 1)
-        v_tensor = v_tensor.view(seq_len, self.n_heads, self.head_dim).transpose(0, 1)
-        
+        total = k_tensor.shape[0]
+        length = max(1, total // max(1, self.n_heads))
+        # reshape to [n_heads, length, head_dim]
+        k_tensor = k_tensor[: self.n_heads * length].contiguous().view(self.n_heads, length, self.head_dim)
+        v_tensor = v_tensor[: self.n_heads * length].contiguous().view(self.n_heads, length, self.head_dim)
         return k_tensor, v_tensor
     
     def forward(self, query: torch.Tensor,
@@ -474,6 +494,7 @@ class TeleportAttention(nn.Module):
         
         
         teleport_outputs = []
+        weights = []
         
         for anchor_node, similarity in anchors:
             mini_k, mini_v = self.fetch_mini_kv(anchor_node, warm_kv_storage)
@@ -481,11 +502,17 @@ class TeleportAttention(nn.Module):
             if mini_k is not None and mini_v is not None:
                 
                 mini_attn = self._compute_attention(q, mini_k, mini_v)
-                teleport_outputs.append(mini_attn * similarity)  
-        
+                teleport_outputs.append(mini_attn)
+                weights.append(max(similarity, 0.0))
         
         if teleport_outputs:
-            teleport_combined = torch.stack(teleport_outputs).mean(dim=0)
+            w = torch.tensor(weights, dtype=torch.float32, device=hot_attn.device)
+            if torch.sum(w) > 0:
+                w = w / torch.sum(w)
+            else:
+                w = torch.full((len(teleport_outputs),), 1.0/len(teleport_outputs), device=hot_attn.device)
+            stacked = torch.stack(teleport_outputs)
+            teleport_combined = torch.sum(stacked * w.view(-1, 1, 1, 1), dim=0)
             
             output = 0.7 * hot_attn + 0.3 * teleport_combined
         else:
@@ -508,6 +535,11 @@ class TeleportAttention(nn.Module):
         v = v.unsqueeze(0).expand(batch_size, -1, -1, -1)
         
         
+        # ensure same device and dtype for matmul
+        dev = q.device
+        q = q.to(torch.float32)
+        k = k.to(device=dev, dtype=torch.float32)
+        v = v.to(device=dev, dtype=torch.float32)
         scale = self.head_dim ** -0.5
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
         attn_weights = F.softmax(attn_weights, dim=-1)
@@ -595,12 +627,21 @@ class InfinityWindow:
         
         if not self.pq_compressor.is_trained:
             self.pq_compressor.train(k_np)
+        else:
+            # incremental update of codebooks
+            self.pq_compressor.partial_fit(k_np)
         
         
         k_codes, k_codebooks = self.pq_compressor.encode(k_np)
         
         
         v_compressed = self.lr_compressor.compress(v_np)
+        # reconstruction error bound (store for diagnostics)
+        try:
+            v_rec = self.lr_compressor.decompress(v_compressed)
+            err = float(np.linalg.norm(v_np - v_rec) / max(1.0, np.linalg.norm(v_np)))
+        except Exception:
+            err = 0.0
         
         
         anchors = {}
@@ -610,6 +651,8 @@ class InfinityWindow:
                 anchors[head] = np.mean(head_k, axis=0)
         
         
+        # compute simple compression ratio
+        comp_ratio = float(k_codes.size * 1.0 / max(1, k_np.size))
         window = WarmKVWindow(
             timestamp=time.time(),
             start_pos=start_pos,
@@ -618,7 +661,7 @@ class InfinityWindow:
             k_codebooks=k_codebooks,
             v_compressed=v_compressed,
             anchors=anchors,
-            metadata={'compression_time': time.time()}
+            metadata={'compression_time': time.time(), 'importance': 0.0, 'last_access': time.time(), 'compression_ratio': comp_ratio, 'recon_error': err}
         )
         
         
@@ -637,13 +680,19 @@ class InfinityWindow:
 """
         
         windows = list(self.warm_kv_storage.items())
-        windows.sort(key=lambda x: x[1].timestamp)
-        
+        # Compute priority: alpha*time_penalty + beta*(1-importance)
+        now = time.time()
+        def _priority(win: WarmKVWindow) -> float:
+            meta = getattr(win, 'metadata', {})
+            imp = float(meta.get('importance', 0.0))
+            last = float(meta.get('last_access', win.timestamp))
+            time_penalty = max(0.0, (now - last))
+            return self.config.eviction_alpha * time_penalty + self.config.eviction_beta * (1.0 - imp)
+        windows.sort(key=lambda x: _priority(x[1]), reverse=True)
         
         to_remove = len(windows) - self.config.warm_max_windows
-        for i in range(to_remove):
-            key, window = windows[i]
-            
+        for i in range(max(0, to_remove)):
+            key, _window = windows[i]
             del self.warm_kv_storage[key]
     
     def _update_context_tree(self, text: str, embeddings: torch.Tensor) -> None:
@@ -706,14 +755,30 @@ class InfinityWindow:
         """
 """
         self.stats['teleport_calls'] += 1
-        
-        return self.teleport_attention(
+
+        out = self.teleport_attention(
             query=query,
             hot_kv=self.hot_kv,
             context_tree=self.context_tree,
             warm_kv_storage=self.warm_kv_storage,
             use_teleport=use_teleport
         )
+        # Update metadata importance/last_access for accessed warm windows (anchor nodes used)
+        try:
+            anchors = self.teleport_attention.select_anchors(query, self.context_tree, self.config.max_anchors)
+            for node, sim in anchors:
+                key = f"{node.start_pos}_{node.end_pos}"
+                if key in self.warm_kv_storage:
+                    w = self.warm_kv_storage[key]
+                    meta = w.metadata or {}
+                    meta['last_access'] = time.time()
+                    # importance: EMA by similarity evidence
+                    old = float(meta.get('importance', 0.0))
+                    meta['importance'] = 0.9 * old + 0.1 * max(0.0, float(sim))
+                    w.metadata = meta
+        except Exception:
+            pass
+        return out
     
     def save_state(self, path: str) -> None:
         """

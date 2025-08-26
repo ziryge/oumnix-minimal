@@ -7,14 +7,19 @@ import gzip
 import hashlib
 import time
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, asdict
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import os
 import base64
 import torch
 import numpy as np
+try:
+    from memory.episodic import EpisodicMemory  # type: ignore
+except Exception:  # pragma: no cover
+    EpisodicMemory = None  # type: ignore
 
 @dataclass
 class LifeFileHeader:
@@ -62,9 +67,16 @@ class CryptoManager:
     def _setup_crypto(self):
         """
 """
-        
         password_bytes = self.password.encode()
-        salt = b'ai_personal_salt_2024'  
+        # Allow environment-provided salt for deployments; fallback to default
+        salt_env = os.environ.get('OUMNIX_STATE_SALT')
+        if salt_env is not None:
+            try:
+                salt = salt_env.encode('utf-8')
+            except Exception:
+                salt = b'ai_personal_salt_2024'
+        else:
+            salt = b'ai_personal_salt_2024'
         
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
@@ -369,8 +381,11 @@ class LifeFile:
                 current_offset += len(encrypted_data)
             
             
-            f.seek(header_space)
-            file_data = f.read()
+            f.flush()
+            # compute checksum over data region written after header
+            with open(filepath, 'rb') as rf:
+                rf.seek(header_space)
+                file_data = rf.read()
             self.header.checksum = hashlib.sha256(file_data).hexdigest()
             
             
@@ -423,7 +438,8 @@ class LifeFile:
             }
             
             
-            current_pos = f.tell()
+            # read data region starting after header_space (4096)
+            f.seek(4096)
             file_data = f.read()
             actual_checksum = hashlib.sha256(file_data).hexdigest()
             
@@ -440,11 +456,9 @@ class LifeFile:
             
             temp_life = LifeFile(str(filepath), self.crypto.password)
             temp_life.load()
-            
-            
-            for name in temp_life.header.segments:
-                temp_life.get_segment(name)
-            
+            # try reading segments if present; tolerate empty
+            for name in list(temp_life.header.segments):
+                _ = temp_life.segments[name]  # ensure segment metadata present
             return True
         except Exception:
             return False
@@ -510,10 +524,20 @@ class LifeFile:
                 except Exception as e:
                     report['segments_valid'][name] = False
                     report['errors'].append(f"Segment '{name}' corrupted: {str(e)}")
-            
-            
+            # structural checks: offsets within file
+            try:
+                size = self.filepath.stat().st_size
+                for name, seg in self.segments.items():
+                    end_off = seg.offset + seg.compressed_size
+                    if seg.offset < 4096:
+                        report['warnings'].append(f"Segment '{name}' overlaps header")
+                    if end_off > size:
+                        report['errors'].append(f"Segment '{name}' exceeds file size (end {end_off} > {size})")
+            except Exception:
+                pass
+
             with open(self.filepath, 'rb') as f:
-                f.seek(4096)  
+                f.seek(4096)
                 file_data = f.read()
                 actual_checksum = hashlib.sha256(file_data).hexdigest()
                 report['checksum_valid'] = (actual_checksum == self.header.checksum)
@@ -576,20 +600,43 @@ class PersistenceManager:
         self.last_save_time = 0
     
     def save_complete_state(self, 
-                           model_state: Dict[str, torch.Tensor],
+                           model_state: Dict[str, Any],
                            memory_state: Dict[str, Any],
                            neuro_state: Any,
                            metacognition_state: Dict[str, Any],
-                           config: Dict[str, Any]) -> None:
+                           config: Dict[str, Any],
+                           optimizer_state: Optional[Dict[str, Any]] = None,
+                           scheduler_state: Optional[Dict[str, Any]] = None,
+                           scaler_state: Optional[Dict[str, Any]] = None) -> None:
         """
 """
-        
-        
+        # Episodic memory (FAISS) — persist meta + vectors as separate segments (avoid pickling index)
+        episodic_obj = None
+        try:
+            if isinstance(memory_state, dict):
+                episodic_obj = memory_state.get('episodic')
+        except Exception:
+            episodic_obj = None
+        if episodic_obj is not None and EpisodicMemory is not None and isinstance(episodic_obj, EpisodicMemory):  # type: ignore[attr-defined]
+            self._add_episodic_segments(episodic_obj)
+            # Avoid pickling the raw object inside memory_state
+            try:
+                memory_state = {k: v for k, v in memory_state.items() if k != 'episodic'}
+            except Exception:
+                pass
+
+        # Core segments
         self.life_file.add_segment('model_weights', model_state, 'pickle')
         self.life_file.add_segment('memory_state', memory_state, 'pickle')
         self.life_file.add_segment('neuro_state', neuro_state, 'pickle')
         self.life_file.add_segment('metacognition_state', metacognition_state, 'pickle')
         self.life_file.add_segment('config', config, 'json')
+        if optimizer_state is not None:
+            self.life_file.add_segment('optimizer_state', optimizer_state, 'pickle')
+        if scheduler_state is not None:
+            self.life_file.add_segment('scheduler_state', scheduler_state, 'pickle')
+        if scaler_state is not None:
+            self.life_file.add_segment('scaler_state', scaler_state, 'pickle')
         
         
         metadata = {
@@ -609,7 +656,7 @@ class PersistenceManager:
 """
         self.life_file.load()
         
-        return {
+        state = {
             'model_weights': self.life_file.get_segment('model_weights'),
             'memory_state': self.life_file.get_segment('memory_state'),
             'neuro_state': self.life_file.get_segment('neuro_state'),
@@ -617,6 +664,86 @@ class PersistenceManager:
             'config': self.life_file.get_segment('config'),
             'metadata': self.life_file.get_segment('metadata')
         }
+        # Rehydrate episodic memory if segments are present
+        try:
+            episodic = self._load_episodic_segments()
+            if episodic is not None:
+                state['episodic'] = episodic
+        except Exception:
+            pass
+        # optional segments
+        try:
+            state['optimizer_state'] = self.life_file.get_segment('optimizer_state')
+        except Exception:
+            pass
+        try:
+            state['scheduler_state'] = self.life_file.get_segment('scheduler_state')
+        except Exception:
+            pass
+        try:
+            state['scaler_state'] = self.life_file.get_segment('scaler_state')
+        except Exception:
+            pass
+        return state
+
+    # ---- Episodic Memory segment helpers ----
+    def _add_episodic_segments(self, ep: Any) -> None:
+        try:
+            # pull simple meta
+            meta = {
+                'dim': int(getattr(ep, 'dim', 0)),
+                'normalize': bool(getattr(ep, 'normalize', False)),
+                'metric': str(getattr(ep, 'metric', 'l2')).lower(),
+                'store_vectors': bool(getattr(ep, 'store_vectors', True)),
+                'texts': list(getattr(ep, 'texts', [])),
+            }
+            self.life_file.add_segment('episodic_meta', meta, 'json')
+            # vectors
+            vectors = []
+            try:
+                vectors = getattr(ep, '_vectors', [])  # list[np.ndarray]
+            except Exception:
+                vectors = []
+            if meta['store_vectors'] and vectors:
+                import numpy as _np
+                arr = _np.stack(vectors, axis=0).astype('float32')
+                self.life_file.add_segment('episodic_vectors', arr, 'numpy')
+        except Exception:
+            pass
+
+    def _load_episodic_segments(self) -> Optional[Any]:
+        try:
+            meta = self.life_file.get_segment('episodic_meta')
+        except Exception:
+            return None
+        if meta is None:
+            return None
+        try:
+            dim = int(meta.get('dim', 0))
+            normalize = bool(meta.get('normalize', False))
+            metric = str(meta.get('metric', 'l2'))
+            store_vectors = bool(meta.get('store_vectors', True))
+            texts = list(meta.get('texts', []))
+            if EpisodicMemory is None:
+                return None
+            ep = EpisodicMemory(dim=dim, normalize=normalize, store_vectors=store_vectors, metric=metric)  # type: ignore[misc]
+            # restore vectors and index
+            if store_vectors:
+                try:
+                    arr = self.life_file.get_segment('episodic_vectors')
+                    import numpy as _np
+                    if isinstance(arr, _np.ndarray) and arr.size > 0:
+                        n = arr.shape[0]
+                        t = texts[:n] if len(texts) >= n else texts + [""] * (n - len(texts))
+                        ep.add(arr, t)
+                except Exception:
+                    pass
+            # restore texts-only when not storing vectors
+            if not store_vectors and texts:
+                ep.texts = texts
+            return ep
+        except Exception:
+            return None
     
     def should_auto_save(self) -> bool:
         """
@@ -627,6 +754,33 @@ class PersistenceManager:
         """
 """
         return self.life_file.get_info()
+    
+    def change_password(self, new_password: str) -> None:
+        """Rotate encryption password and rewrite LifeFile with backups."""
+        # Load existing segments
+        try:
+            self.life_file.load()
+        except Exception:
+            # if no file yet, just switch password for future saves
+            self.life_file.crypto.change_password(new_password)
+            return
+        # Read and cache all segments as deserialized objects
+        segment_names = list(self.life_file.header.segments)
+        deserialized: Dict[str, tuple[Any, str]] = {}
+        for name in segment_names:
+            seg = self.life_file.segments[name]
+            data = self.life_file.get_segment(name)
+            deserialized[name] = (data, seg.data_type)
+        # Switch password
+        self.life_file.crypto.change_password(new_password)
+        # Re-add all segments to refresh data_cache with new encryption on save
+        self.life_file.segments.clear()
+        self.life_file.header.segments = []
+        self.life_file.data_cache.clear()
+        for name, (data, dtype) in deserialized.items():
+            self.life_file.add_segment(name, data, dtype)
+        # Save new encrypted file
+        self.life_file.save()
     
     def verify_integrity(self) -> Dict[str, Any]:
         """

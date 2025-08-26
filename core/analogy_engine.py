@@ -2,16 +2,16 @@
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+# from torch.nn import functional as F
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
 import networkx as nx
-from sklearn.manifold import TSNE
+# from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
-from scipy.spatial.distance import cdist
-from scipy.optimize import linear_sum_assignment
+# from scipy.spatial.distance import cdist
+# from scipy.optimize import linear_sum_assignment
 import time
 import pickle
 import hashlib
@@ -71,7 +71,7 @@ class AnalogicalMapping:
 class StructuralEncoder(nn.Module):
     """
 """
-    def __init__(self, vocab_size: int = 1000, embed_dim: int = 128, hidden_dim: int = 256):
+    def __init__(self, vocab_size: int = 1000, embed_dim: int = 128, hidden_dim: int = 256, seed: int = 1337):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -100,6 +100,28 @@ class StructuralEncoder(nn.Module):
         
         self.vocab = {}
         self.next_id = 0
+
+        # Deterministic initialization
+        # Use global seed for broad compatibility across torch versions
+        try:
+            torch.manual_seed(seed)
+        except Exception:
+            pass
+        for m in list(self.graph_encoder.modules()) + list(self.final_encoder.modules()) + [self.entity_embed, self.relation_embed]:
+            if isinstance(m, nn.Linear):
+                try:
+                    nn.init.xavier_uniform_(m.weight, gain=1.0)
+                except Exception:
+                    nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                with torch.no_grad():
+                    try:
+                        m.weight.copy_(torch.randn_like(m.weight) * 0.02)
+                    except Exception:
+                        m.weight.uniform_(-0.02, 0.02)
+
     
     def _get_token_id(self, token: str) -> int:
         """
@@ -107,7 +129,10 @@ class StructuralEncoder(nn.Module):
         if token not in self.vocab:
             if self.next_id >= self.vocab_size:
                 
-                return hash(token) % self.vocab_size
+                import unicodedata
+                tok = unicodedata.normalize('NFKC', token).lower()
+                h = hashlib.sha256(tok.encode('utf-8')).hexdigest()
+                return int(h[:16], 16) % self.vocab_size
             self.vocab[token] = self.next_id
             self.next_id += 1
         return self.vocab[token]
@@ -162,9 +187,10 @@ class IsletManifold:
         
         self.similarity_graph = nx.Graph()
         self.similarity_threshold = 0.7
+        self.top_k_edges = 10
         
         
-        self.structure_encoder = StructuralEncoder()
+        self.structure_encoder = StructuralEncoder(seed=1337)
         
         
         self.n_clusters = 50
@@ -237,21 +263,19 @@ class IsletManifold:
         new_embedding = self.structure_encoder.encode_task(new_seed.task_structure).numpy()
         
         
+        sims = []
         for i, (seed_id, seed) in enumerate(self.seeds.items()):
             if seed_id == new_seed_id:
                 continue
-            
-            
             structural_sim = np.dot(new_embedding, self.seed_embeddings[i])
             structural_sim = structural_sim / (np.linalg.norm(new_embedding) * np.linalg.norm(self.seed_embeddings[i]) + 1e-8)
-            
-            
             domain_sim = 1.0 if new_seed.task_structure.domain == seed.task_structure.domain else 0.3
-            
-            
             combined_sim = 0.7 * structural_sim + 0.3 * domain_sim
-            
-            
+            sims.append((seed_id, combined_sim))
+        # sort and add top-k above threshold (parametrizável)
+        k = getattr(self, 'top_k_edges', self.top_k_edges)
+        sims.sort(key=lambda x: x[1], reverse=True)
+        for seed_id, combined_sim in sims[:k]:
             if combined_sim > self.similarity_threshold:
                 self.similarity_graph.add_edge(new_seed_id, seed_id, weight=combined_sim)
     
@@ -447,14 +471,95 @@ class AnalogyEngine:
 """
     def __init__(self, seed_dim: int = 16, max_seeds: int = 1000):
         self.manifold = IsletManifold(seed_dim, max_seeds)
-        self.active_ephemeral: Dict[str, Tuple[str, np.ndarray]] = {}  
-        
-        
+        self.active_ephemeral: Dict[str, Tuple[str, np.ndarray]] = {}
         self.transfer_threshold = 0.5
         self.promotion_threshold = 0.7
-        
-        
         self.transfer_history = deque(maxlen=500)
+    def build_task_structure(self, data: Dict[str, Any], task_id: str = "task", domain: str = "general") -> TaskStructure:
+        items = list(data.items()) if isinstance(data, dict) else []
+        entities = [str(k) for k, _ in items]
+        relations: List[Tuple[str, str, str]] = []
+        constraints: List[str] = []
+        seen = set()
+        exclusive_pairs = getattr(self, 'exclusive_relation_pairs', {('parent_of', 'child_of'), ('before', 'after')})
+        for i, (ka, va) in enumerate(items):
+            for j, (kb, vb) in enumerate(items):
+                if i == j:
+                    continue
+                pair = tuple(sorted([ka, kb]))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                rel = "similar" if np.allclose(np.array(va), np.array(vb)) else "related"
+                relations.append((str(ka), rel, str(kb)))
+        # duplicates
+        trip_count: Dict[Tuple[str, str, str], int] = {}
+        for a, r, b in relations:
+            key = (a, r, b)
+            trip_count[key] = trip_count.get(key, 0) + 1
+        for key, cnt in trip_count.items():
+            if cnt > 1:
+                constraints.append(f"duplicate:{key[0]}:{key[1]}:{key[2]}:{cnt}")
+        # contradictions
+        rel_map: Dict[Tuple[str, str], set] = {}
+        for a, r, b in relations:
+            k = tuple(sorted([a, b]))
+            rel_map.setdefault(k, set()).add(r)
+        for k, rs in rel_map.items():
+            for x, y in exclusive_pairs:
+                if x in rs and y in rs:
+                    constraints.append(f"contradiction:{k[0]}:{k[1]}:{x}|{y}")
+        G = nx.Graph()
+        for a, _, b in relations:
+            G.add_edge(a, b)
+        density = float(nx.density(G)) if G.number_of_nodes() > 1 else 0.0
+        avg_deg = float(np.mean([d for _, d in G.degree()])) if G.number_of_nodes() > 0 else 0.0
+        try:
+            clustering = float(np.mean(list(nx.clustering(G).values()))) if G.number_of_nodes() > 0 else 0.0
+        except Exception:
+            clustering = 0.0
+        try:
+            components = nx.number_connected_components(G) if G.number_of_nodes() > 0 else 0
+        except Exception:
+            components = 0
+        try:
+            assort = float(nx.degree_assortativity_coefficient(G)) if G.number_of_nodes() > 1 else 0.0
+        except Exception:
+            assort = 0.0
+        metrics = {"graph_density": density, "avg_degree": avg_deg, "clustering": clustering, "components": components, "assortativity": assort, "nodes": G.number_of_nodes(), "edges": G.number_of_edges()}
+        return TaskStructure(task_id=task_id, domain=domain, entities=entities, relations=relations, constraints=constraints, goal_pattern="", complexity_metrics=metrics)
+    def to_graph(self, task: TaskStructure) -> nx.Graph:
+        G = nx.Graph()
+        G.add_nodes_from(task.entities)
+        for a, r, b in task.relations:
+            G.add_edge(a, b, relation=r)
+        return G
+    def sample_analogies(self, k: int = 3) -> List[Tuple[str, str, float]]:
+        if self.manifold.seed_embeddings is None or not getattr(self.manifold, 'seed_ids_ordered', None):
+            return []
+        ids = self.manifold.seed_ids_ordered
+        emb = self.manifold.seed_embeddings
+        out: List[Tuple[str, str, float]] = []
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = emb[i], emb[j]
+                sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+                out.append((ids[i], ids[j], sim))
+        out.sort(key=lambda x: x[2], reverse=True)
+        return out[:k]
+    def evaluate(self, mapping: Dict[str, str], source: TaskStructure, target: TaskStructure) -> float:
+        if not mapping:
+            return 0.0
+        mapped = set((mapping.get(a, a), r, mapping.get(b, b)) for a, r, b in source.relations)
+        tgt = set((a, r, b) for a, r, b in target.relations)
+        inter = len(mapped & tgt)
+        total = max(1, len(source.relations))
+        score = inter / total
+        return float(max(0.0, min(1.0, score)))
+    def save(self, path: str) -> None:
+        self.save_state(path)
+    def load(self, path: str) -> None:
+        self.load_state(path)
         
     def register_task_solution(self, task: TaskStructure, seed_vector: np.ndarray, 
                               success: bool) -> str:
@@ -597,12 +702,23 @@ class AnalogyEngine:
     def save_state(self, path: str) -> None:
         """
 """
+        # Persist encoder weights and vocab for determinism across runs
+        enc = self.manifold.structure_encoder
+        encoder_state = {
+            'entity_embed': enc.entity_embed.state_dict(),
+            'relation_embed': enc.relation_embed.state_dict(),
+            'graph_encoder': enc.graph_encoder.state_dict(),
+            'final_encoder': enc.final_encoder.state_dict(),
+            'vocab': enc.vocab,
+            'next_id': enc.next_id,
+        }
         state = {
             'manifold': self.manifold,
             'active_ephemeral': self.active_ephemeral,
             'transfer_history': list(self.transfer_history),
             'transfer_threshold': self.transfer_threshold,
-            'promotion_threshold': self.promotion_threshold
+            'promotion_threshold': self.promotion_threshold,
+            'encoder_state': encoder_state,
         }
         
         with open(path, 'wb') as f:
@@ -619,6 +735,19 @@ class AnalogyEngine:
         self.transfer_history = deque(state['transfer_history'], maxlen=500)
         self.transfer_threshold = state['transfer_threshold']
         self.promotion_threshold = state['promotion_threshold']
+        # Restore encoder weights and vocab for determinism
+        try:
+            enc_state = state.get('encoder_state')
+            if enc_state:
+                enc = self.manifold.structure_encoder
+                enc.entity_embed.load_state_dict(enc_state['entity_embed'])
+                enc.relation_embed.load_state_dict(enc_state['relation_embed'])
+                enc.graph_encoder.load_state_dict(enc_state['graph_encoder'])
+                enc.final_encoder.load_state_dict(enc_state['final_encoder'])
+                enc.vocab = enc_state.get('vocab', enc.vocab)
+                enc.next_id = enc_state.get('next_id', enc.next_id)
+        except Exception:
+            pass
 
 __all__ = [
     'AnalogyEngine',

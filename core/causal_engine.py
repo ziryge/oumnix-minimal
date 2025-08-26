@@ -1,11 +1,11 @@
 """
 """
-import torch
-import torch.nn as nn
+# import torch
+# import torch.nn as nn
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass, field
-from collections import defaultdict, deque
+from collections import deque
 import networkx as nx
 from scipy import stats
 import time
@@ -47,6 +47,25 @@ class StructuralCausalModel:
         
         self.equations: Dict[str, Dict[str, float]] = {}  
         self.noise_terms: Dict[str, float] = {}  
+        
+    def add_relation_simple(self, cause: str, effect: str, strength: float, confidence: float, contexts: list[str] | None = None) -> None:
+        rel = CausalRelation(cause=cause, effect=effect, strength=float(strength), confidence=float(confidence), contexts=list(contexts or []))
+        self.add_relation(rel)
+
+    def set_equation(self, node: str, weights: Dict[str, float], bias: float = 0.0, noise_std: float = 0.0) -> None:
+        self.equations[node] = {**weights, "__bias__": float(bias)}
+        self.noise_terms[node] = float(noise_std)
+
+    def to_dag(self) -> nx.DiGraph:
+        if not nx.is_directed_acyclic_graph(self.graph):
+            raise ValueError("Causal graph contains cycles")
+        return self.graph.copy()
+
+    def topological_order(self) -> list[str]:
+        try:
+            return list(nx.topological_sort(self.graph))
+        except nx.NetworkXUnfeasible as e:
+            raise ValueError("Causal graph contains cycles") from e
         
     def add_relation(self, relation: CausalRelation) -> None:
         """
@@ -90,22 +109,33 @@ class StructuralCausalModel:
         result = interventions.copy()
         
         
-        try:
-            topo_order = list(nx.topological_sort(self.graph))
-        except nx.NetworkXError:
-            
-            topo_order = list(self.variables)
-        
+        # Ensure DAG
+        if not nx.is_directed_acyclic_graph(self.graph):
+            raise ValueError("Causal graph contains cycles")
+        topo_order = list(nx.topological_sort(self.graph))
         
         for var in topo_order:
             if var in interventions:
                 continue  
             
+            # Equation-based when present
+            if var in self.equations:
+                eq = self.equations[var]
+                val = float(eq.get("__bias__", 0.0))
+                for parent, w in eq.items():
+                    if parent == "__bias__":
+                        continue
+                    if parent in result:
+                        val += float(w) * float(result[parent])
+                if var in self.noise_terms and self.noise_terms[var] > 0.0:
+                    val += float(np.random.normal(0, self.noise_terms[var]))
+                result[var] = val
+                continue
+
             parents = self.get_parents(var)
             if not parents:
                 continue
-            
-            
+
             value = 0.0
             for parent in parents:
                 if parent in result:
@@ -114,16 +144,18 @@ class StructuralCausalModel:
                         relation = self.relations[relation_key]
                         if context in relation.contexts or not relation.contexts:
                             value += relation.strength * result[parent]
-            
-            
-            if var in self.noise_terms:
-                noise = np.random.normal(0, self.noise_terms[var])
-                value += noise
-            
+
+            if var in self.noise_terms and self.noise_terms[var] > 0.0:
+                value += float(np.random.normal(0, self.noise_terms[var]))
+
             result[var] = value
         
         return result
     
+    def simulate(self, context: str = "default") -> Dict[str, float]:
+        """Simulate values without interventions using equations/relations in DAG order."""
+        return self.simulate_intervention({}, context)
+
     def estimate_effect(self, cause: str, effect: str, 
                        intervention_value: float = 1.0,
                        context: str = "default") -> float:

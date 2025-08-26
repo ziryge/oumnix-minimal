@@ -14,6 +14,13 @@ from torch.utils.data import Dataset, DataLoader
 import re
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
+from utils.logging_utils import get_logger
+from utils.metrics import MovingAverage, Timer, PerfTracker
+from utils.omnx_exporter import start_omnx_exporter
+from memory.persistence import PersistenceManager
+
+# Global perf tracker for OMNX exporter
+PERF_EXPORT = PerfTracker(window=100)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,24 +29,24 @@ if str(PROJECT_ROOT) not in sys.path:
 # Tokenizer
 try:
     from utils.tokenizer import tokenizer
-    print("[OK] Tokenizer loaded")
+    get_logger("train_streaming").info("Tokenizer loaded")
 except ImportError as e:
-    print(f"[FAIL] Tokenizer error: {e}")
+    get_logger("train_streaming").error(f"Tokenizer error: {e}")
     sys.exit(1)
 
 # Model
 try:
     from core.oumnix_ai import create_oumnix_ai, OumnixAIConfig
     USE_ADVANCED_MODEL = True
-    print("[OK] Advanced model available")
+    get_logger("train_streaming").info("Advanced model available")
 except ImportError as e:
-    print(f"[WARN] Advanced model not available: {e}")
+    get_logger("train_streaming").warning(f"Advanced model not available: {e}")
     try:
         from core.model import OumnixSimpleAI
         USE_ADVANCED_MODEL = False
-        print("[OK] Using simple model")
+        get_logger("train_streaming").info("Using simple model")
     except ImportError as e2:
-        print(f"[FAIL] No model available: {e2}")
+        get_logger("train_streaming").error(f"No model available: {e2}")
         sys.exit(1)
 
 
@@ -55,7 +62,8 @@ class StreamingDataset(Dataset):
         self.files = []
         for ext in ['*.json', '*.jsonl', '*.txt']:
             self.files.extend(self.dataset_dir.rglob(ext))
-        print(f"[INFO] Found {len(self.files)} files (streaming all)")
+        logger = get_logger("train_streaming.dataset")
+        logger.info(f"Found {len(self.files)} files (streaming all)")
 
         self.total_lines = 0
         self.file_line_counts = []
@@ -68,7 +76,7 @@ class StreamingDataset(Dataset):
             except Exception:
                 self.file_line_counts.append(0)
 
-        print(f"[INFO] Approx. total: {self.total_lines} lines")
+        logger.info(f"Approx. total: {self.total_lines} lines")
 
         self.current_chunk = []
         self.current_chunk_idx = 0
@@ -114,11 +122,13 @@ class StreamingDataset(Dataset):
                                     break
                         current_line += 1
             except Exception as e:
-                print(f"[WARN] Failed to read {file_path}: {e}")
+                logger = get_logger("train_streaming.dataset")
+                logger.warning(f"Failed to read {file_path}: {e}")
                 continue
 
         self.chunk_start_idx = start_idx
-        print(f"[INFO] Chunk loaded: {len(self.current_chunk)} samples (start: {start_idx})")
+        logger = get_logger("train_streaming.dataset")
+        logger.info(f"Chunk loaded: {len(self.current_chunk)} samples (start: {start_idx})")
         gc.collect()
 
     def _extract_texts(self, line: str):
@@ -216,13 +226,19 @@ def save_checkpoint_step(model, optimizer, scaler, args, epoch, global_step, avg
         'args': vars(args)
     }
     path = os.path.join(args.out_dir, f"ckpt_step_{global_step}.pt")
-    torch.save(ckpt, path)
-    print(f"[INFO] Step checkpoint saved: {path}")
+    tmp = path + ".tmp"
+    torch.save(ckpt, tmp)
+    os.replace(tmp, path)
+    logger = get_logger("train_streaming")
+    logger.info(f"Step checkpoint saved: {path}")
 
 
 def create_model_streaming(args):
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')
     if USE_ADVANCED_MODEL:
-        print("[INFO] Creating advanced model (streaming mode)...")
+        logger = get_logger("train_streaming")
+        logger.info("Creating advanced model (streaming mode)...")
         config = OumnixAIConfig(
             vocab_size=tokenizer.vocab_size,
             model_dim=args.dim,
@@ -237,7 +253,8 @@ def create_model_streaming(args):
         )
         model = create_oumnix_ai(config)
     else:
-        print("[INFO] Creating simple model (streaming mode)...")
+        logger = get_logger("train_streaming")
+        logger.info("Creating simple model (streaming mode)...")
         model = OumnixSimpleAI(
             vocab_size=tokenizer.vocab_size,
             dim=args.dim,
@@ -261,6 +278,9 @@ def train_epoch_streaming(model, dataset, optimizer, scaler, device, epoch, args
     )
 
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    step_timer = Timer()
+    step_timer.start()
+    perf = PerfTracker(window=100)
 
     for step, (ids, targets) in enumerate(progress_bar):
         if ids.numel() == 0:
@@ -279,7 +299,8 @@ def train_epoch_streaming(model, dataset, optimizer, scaler, device, epoch, args
                     logits = _out['logits'] if isinstance(_out, dict) else _out
                     del _out
                 except Exception as e:
-                    print(f"[WARN] Advanced model failed: {e}")
+                    logger = get_logger("train_streaming")
+                    logger.warning(f"Advanced model failed: {e}")
                     logits = model.core_model.lm_head(model.core_model.token_embed(ids))
             else:
                 logits = model(ids)
@@ -309,7 +330,40 @@ def train_epoch_streaming(model, dataset, optimizer, scaler, device, epoch, args
         })
 
         if (step + 1) % args.log_interval == 0:
-            print(f"[INFO] Epoch {epoch} | Step {step+1} | Loss: {avg_loss:.4f} | Samples: {num_samples}")
+            logger = get_logger("train_streaming")
+            dt = step_timer.stop()
+            step_timer.start()
+            tokens = args.batch_size * args.max_length * args.log_interval
+            # Aggregate attention metrics when available
+            kv_hit = 0.0
+            head_drop = 0.0
+            n = 0
+            try:
+                core = getattr(model, 'core_model', None)
+                layers_src = None
+                if core is not None and hasattr(core, 'layers'):
+                    layers_src = core.layers
+                elif hasattr(model, 'layers'):
+                    layers_src = model.layers
+                if layers_src is not None:
+                    for layer in layers_src:
+                        try:
+                            att = layer[0]
+                            if hasattr(att, 'last_kv_hit') and hasattr(att, 'last_head_drop'):
+                                kv_hit += float(att.last_kv_hit)
+                                head_drop += float(att.last_head_drop)
+                                n += 1
+                        except Exception:
+                            continue
+                if n > 0:
+                    kv_hit /= n
+                    head_drop /= n
+            except Exception:
+                pass
+            perf.update(tokens=tokens, seconds=dt, kv_hit=kv_hit, head_drop=head_drop)
+            PERF_EXPORT.update(tokens=tokens, seconds=dt, kv_hit=kv_hit, head_drop=head_drop)
+            snap = perf.snapshot()
+            logger.info(f"Epoch {epoch} | Step {step+1} | Loss: {avg_loss:.4f} | Samples: {num_samples} | ms/token: {snap['ms_per_token']:.3f} | tokens/s: {snap['tokens_per_sec']:.1f} | vram_gb: {snap['vram_gb']:.2f}")
 
         global_step += 1
         if args.save_every_steps and args.save_every_steps > 0 and (global_step % args.save_every_steps == 0):
@@ -325,6 +379,12 @@ def train_epoch_streaming(model, dataset, optimizer, scaler, device, epoch, args
 
 def main():
     parser = argparse.ArgumentParser(description="Streaming Training")
+    try:
+        from utils.seeds import set_seed
+        set_seed(1337)
+    except Exception:
+        pass
+    parser.add_argument('--deterministic', action='store_true', help='Enable deterministic mode')
     parser.add_argument('--epochs', type=int, default=2, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size (small for streaming)')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
@@ -343,20 +403,37 @@ def main():
     parser.add_argument('--out_dir', type=str, default='checkpoints_streaming', help='Output directory')
     parser.add_argument('--resume', action='store_true', help='Resume from last checkpoint')
 
+    # Persistence flags parity with train.py
+    parser.add_argument('--save-full-state', dest='save_full_state', action='store_true', help='Save full agent state to LifeFile periodically')
+    parser.add_argument('--resume-full-state', dest='resume_full_state', action='store_true', help='Resume from LifeFile state')
+    parser.add_argument('--state-dir', dest='state_dir', type=str, default='.ai_state', help='Directory for LifeFile persistence')
+    parser.add_argument('--state-password', dest='state_password', type=str, default=os.environ.get('OUMNIX_STATE_PASSWORD', ''), help='Password for LifeFile encryption')
+
     args = parser.parse_args()
 
-    print("Streaming Training")
-    print("=" * 50)
+    logger = get_logger("train_streaming")
+    # Start OMNX exporter
+    start_omnx_exporter(lambda: PERF_EXPORT.snapshot(), port=None)
+
+    logger.info("Streaming Training")
+    logger.info("=" * 50)
+    if args.deterministic:
+        try:
+            from utils.seeds import set_seed as _set_seed
+            _set_seed(1337, deterministic=True)
+            logger.info("Deterministic mode enabled")
+        except Exception:
+            pass
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[INFO] Device: {device}")
+    logger.info(f"Device: {device}")
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"[INFO] GPU: {gpu_name}")
-        print(f"[INFO] VRAM: {vram_gb:.1f}GB")
+        logger.info(f"GPU: {gpu_name}")
+        logger.info(f"VRAM: {vram_gb:.1f}GB")
         if "RTX 40" in gpu_name:
-            print("[INFO] RTX 4000 detected - enabling FP8 optimizations")
+            logger.info("RTX 4000 detected - enabling FP8 optimizations")
             args.use_fp8 = True
 
     try:
@@ -368,10 +445,10 @@ def main():
             strip_tags=args.strip_tags
         )
         if len(dataset) == 0:
-            print("[FAIL] Empty dataset. Add files to datasets/")
+            logger.error("Empty dataset. Add files to datasets/")
             return
     except Exception as e:
-        print(f"[FAIL] Dataset error: {e}")
+        logger.error(f"Dataset error: {e}")
         import traceback
         traceback.print_exc()
         return
@@ -380,38 +457,70 @@ def main():
         model = create_model_streaming(args)
         model = model.to(device)
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"[INFO] Model parameters: {total_params/1e6:.1f}M")
+        logger.info(f"Model parameters: {total_params/1e6:.1f}M")
     except Exception as e:
-        print(f"[FAIL] Model creation error: {e}")
+        logger.error(f"Model creation error: {e}")
         import traceback
         traceback.print_exc()
         return
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.endswith('.bias') or 'norm' in n.lower() or 'layernorm' in n.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    param_groups = [
+        {"params": decay, "weight_decay": 0.01},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
     scaler = GradScaler() if args.use_amp else None
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print("\nTraining configuration:")
-    print(f"  Epochs: {args.epochs}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Chunk size: {args.chunk_size}")
-    print(f"  Max length: {args.max_length}")
-    print(f"  Mixed precision: {args.use_amp}")
-    print(f"  FP8: {args.use_fp8}")
-    print("-" * 50)
+    logger.info("Training configuration:")
+    logger.info(f"  Epochs: {args.epochs}")
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info(f"  Chunk size: {args.chunk_size}")
+    logger.info(f"  Max length: {args.max_length}")
+    logger.info(f"  Mixed precision: {args.use_amp}")
+    logger.info(f"  FP8: {args.use_fp8}")
+    logger.info("-" * 50)
 
     best_loss = float('inf')
     global_step = 0
 
+    # Persistence manager
+    pm = None
+    if args.save_full_state or args.resume_full_state:
+        pm = PersistenceManager(base_dir=args.state_dir, password=args.state_password)
+
+    # Load full state if requested
+    if args.resume_full_state and pm is not None:
+        try:
+            state = pm.load_complete_state()
+            model.load_state_dict(state['model_weights'])
+            # Restore memory if present
+            try:
+                mem_state = state.get('memory_state') or {}
+                if 'infinity_window' in mem_state and hasattr(model, 'memory_system'):
+                    model.memory_system = mem_state['infinity_window']
+            except Exception:
+                logger.warning("Failed to restore memory state; continuing")
+        except Exception as e:
+            logger.warning(f"Failed to resume full state: {e}")
+
     for epoch in range(1, args.epochs + 1):
-        print(f"\n[INFO] Epoch {epoch}/{args.epochs}")
+        logger.info(f"Epoch {epoch}/{args.epochs}")
         start_time = time.time()
         try:
             avg_loss, global_step = train_epoch_streaming(model, dataset, optimizer, scaler, device, epoch, args, global_step)
             epoch_time = time.time() - start_time
-            print(f"[OK] Epoch {epoch} completed")
-            print(f"  Average loss: {avg_loss:.4f}")
-            print(f"  Time: {epoch_time:.1f}s")
+            logger.info(f"Epoch {epoch} completed")
+            logger.info(f"  Average loss: {avg_loss:.4f}")
+            logger.info(f"  Time: {epoch_time:.1f}s")
 
             checkpoint = {
                 'epoch': epoch,
@@ -423,26 +532,50 @@ def main():
                 'args': vars(args)
             }
             ckpt_path = os.path.join(args.out_dir, f"checkpoint_epoch_{epoch}.pt")
-            torch.save(checkpoint, ckpt_path)
-            print(f"[INFO] Epoch checkpoint saved: {ckpt_path}")
+            tmp_ckpt = ckpt_path + ".tmp"
+            torch.save(checkpoint, tmp_ckpt)
+            os.replace(tmp_ckpt, ckpt_path)
+            logger.info(f"Epoch checkpoint saved: {ckpt_path}")
+
+            # Save full state periodically
+            if args.save_full_state and pm is not None:
+                try:
+                    mem_state = {}
+                    try:
+                        if hasattr(model, 'memory_system'):
+                            mem_state['infinity_window'] = model.memory_system
+                    except Exception:
+                        pass
+                    pm.save_complete_state(
+                        model_state=model.state_dict(),
+                        memory_state=mem_state,
+                        neuro_state={},
+                        metacognition_state={},
+                        config={'dim': args.dim, 'n_layers': args.n_layers, 'n_heads': args.n_heads},
+                    )
+                    logger.info("Full agent state saved to LifeFile (streaming)")
+                except Exception as e:
+                    logger.warning(f"Failed to save full state: {e}")
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 best_path = os.path.join(args.out_dir, "best_model.pt")
-                torch.save(checkpoint, best_path)
-                print(f"[OK] New best model: {best_path}")
+                tmp_best = best_path + ".tmp"
+                torch.save(checkpoint, tmp_best)
+                os.replace(tmp_best, best_path)
+                logger.info(f"New best model: {best_path}")
 
         except Exception as e:
-            print(f"[FAIL] Error in epoch {epoch}: {e}")
+            logger.error(f"Error in epoch {epoch}: {e}")
             import traceback
             traceback.print_exc()
             break
 
-    print("\nTraining finished")
-    print(f"[RESULT] Best loss: {best_loss:.4f}")
-    print(f"[RESULT] Checkpoints saved in: {args.out_dir}")
-    print(f"\nTo run the trained model:")
-    print(f"  python main.py --load-state --state-dir {args.out_dir}")
+    logger.info("Training finished")
+    logger.info(f"Best loss: {best_loss:.4f}")
+    logger.info(f"Checkpoints saved in: {args.out_dir}")
+    logger.info("To run the trained model:")
+    logger.info(f"  python main.py --load-state --state-dir {args.out_dir}")
 
 
 if __name__ == "__main__":

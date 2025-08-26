@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oumnix-minimal"
+version = "0.2.0"
+description = "Oumnix AI – Proprietary Non-Transformer Architecture (minimal edition)"
+readme = "README.md"
+authors = [
+  {name = "qrv0"}
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["ai", "nlp", "non-transformer", "rag", "oumnix"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/qrv0/oumnix-minimal"
+Issues = "https://github.com/qrv0/oumnix-minimal/issues"
+
+[project.optional-dependencies]
+gpu = [
+  "faiss-gpu>=1.7.4 ; platform_system != 'Windows'",
+]
+cpu = [
+  "faiss-cpu>=1.7.4",
+]

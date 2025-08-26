@@ -1,5 +1,3 @@
-"""
-"""
 import os
 import re
 import json
@@ -9,9 +7,13 @@ from pathlib import Path
 from typing import List, Iterable, Optional, Dict, Any
 
 class SimpleTokenizer:
+    _frozen: bool = False
     def __init__(self, dataset_dir: str = "datasets", vocab_path: str | None = None,
                  max_vocab_size: int = 50000, max_files: int | None = 1,
-                 max_lines_per_file: int | None = 100000, lowercase: bool = True):
+                 max_lines_per_file: int | None = 100000, lowercase: bool = True,
+                 use_wordpiece: bool = True,
+                 merge_wordpieces_on_decode: bool = False,
+                 normalize_unicode: bool = False):
         self.dataset_dir = Path(dataset_dir)
         self.vocab_path = Path(vocab_path) if vocab_path else None
         self.unk_token = "<unk>"
@@ -21,11 +23,15 @@ class SimpleTokenizer:
         self.id2token: List[str] = []
         self.token2id: dict[str, int] = {}
         self.max_vocab_size = max_vocab_size
+        self._frozen = False
         self.max_files = max_files
         self.max_lines_per_file = max_lines_per_file
         self.lowercase = lowercase
-        
-        self._version = "regex_ws_v3"
+        self.merge_wordpieces_on_decode = merge_wordpieces_on_decode
+        self.normalize_unicode = normalize_unicode
+        self._version = "regex_wp_v1" if use_wordpiece else "regex_ws_v3"
+        self.use_wordpiece = use_wordpiece
+        self._wp_prefix = "##"
         if self.vocab_path and self.vocab_path.exists():
             loaded_ok = self.load(self.vocab_path)
             if not loaded_ok:
@@ -40,6 +46,8 @@ class SimpleTokenizer:
         """
 """
         counter: Counter[str] = Counter()
+        if self._frozen:
+            raise RuntimeError("Tokenizer is frozen; cannot rebuild vocab")
         files_read = 0
         for file_path in self.dataset_dir.rglob("*.*"):
             if self.max_files is not None and files_read >= self.max_files:
@@ -57,7 +65,7 @@ class SimpleTokenizer:
                         for text in self._extract_texts_from_line(raw):
                             if self.lowercase:
                                 text = text.lower()
-                            for tok in self._basic_tokenize(text):
+                            for tok in (self._wordpiece_tokenize(text) if self.use_wordpiece else self._basic_tokenize(text)):
                                 counter[tok] += 1
                 files_read += 1
             except Exception:
@@ -68,6 +76,7 @@ class SimpleTokenizer:
         self.id2token = [self.pad_token, self.unk_token] + most_common
         self.token2id = {tok: idx for idx, tok in enumerate(self.id2token)}
         if self.vocab_path:
+            os.makedirs(os.path.dirname(str(self.vocab_path)), exist_ok=True)
             self.save(self.vocab_path)
 
     def save(self, path: Path):
@@ -117,9 +126,15 @@ class SimpleTokenizer:
     def encode(self, text: str) -> List[int]:
         """
 """
+        if self.normalize_unicode:
+            try:
+                import unicodedata
+                text = unicodedata.normalize('NFKC', text)
+            except Exception:
+                pass
         if self.lowercase:
             text = text.lower()
-        tokens = self._basic_tokenize(text)
+        tokens = self._wordpiece_tokenize(text) if self.use_wordpiece else self._basic_tokenize(text)
         unk_id = self.token2id.get(self.unk_token, 1)
         return [self.token2id.get(tok, unk_id) for tok in tokens]
 
@@ -128,7 +143,6 @@ class SimpleTokenizer:
 """
         if not ids:
             return ""
-        
         toks = []
         for i in ids:
             tok = self.id2token[i] if 0 <= i < len(self.id2token) else self.unk_token
@@ -137,9 +151,16 @@ class SimpleTokenizer:
             toks.append(tok)
         if not toks:
             return ""
+        if self.merge_wordpieces_on_decode and any(t.startswith(self._wp_prefix) for t in toks):
+            merged: List[str] = []
+            for t in toks:
+                if t.startswith(self._wp_prefix) and merged:
+                    merged[-1] = merged[-1] + t[len(self._wp_prefix):]
+                else:
+                    merged.append(t)
+            toks = merged
         if len(toks) == 1:
             return toks[0]
-        
         attach_to_prev = set(list(".,!?;:%)]}…»\u201d\u2019")) | {"..."}
         no_space_after = set(list("([{«\u201c\u2018"))
         out = []
@@ -158,11 +179,84 @@ class SimpleTokenizer:
     
     
     
+    # Vocab management APIs
+    def freeze(self) -> None:
+        self._frozen = True
+    def unfreeze(self) -> None:
+        self._frozen = False
+    def add_token(self, token: str) -> int:
+        if self._frozen:
+            raise RuntimeError("Tokenizer is frozen; cannot add tokens")
+        if token in self.token2id:
+            return self.token2id[token]
+        if len(self.id2token) >= self.max_vocab_size + len(self.special_tokens):
+            raise RuntimeError("Vocab at capacity")
+        self.id2token.append(token)
+        idx = len(self.id2token) - 1
+        self.token2id[token] = idx
+        return idx
+    def swap_tokens(self, a: str, b: str) -> None:
+        if a not in self.token2id or b not in self.token2id:
+            raise KeyError("Tokens to swap must exist")
+        ia, ib = self.token2id[a], self.token2id[b]
+        self.id2token[ia], self.id2token[ib] = self.id2token[ib], self.id2token[ia]
+        self.token2id[self.id2token[ia]] = ia
+        self.token2id[self.id2token[ib]] = ib
+    def export_json(self, path: str) -> None:
+        data = {
+            "version": self._version,
+            "special_tokens": self.special_tokens,
+            "lowercase": self.lowercase,
+            "id2token": self.id2token,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    def import_json(self, path: str) -> None:
+        if self._frozen:
+            raise RuntimeError("Tokenizer is frozen; cannot import vocab")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or data.get("version") != self._version:
+            raise ValueError("Invalid vocab schema/version")
+        if data.get("special_tokens") != self.special_tokens:
+            raise ValueError("Special tokens mismatch")
+        self.id2token = list(data.get("id2token", []))
+        self.token2id = {t: i for i, t in enumerate(self.id2token)}
     def _basic_tokenize(self, text: str) -> List[str]:
-        """
-"""
-        
         return re.findall(r"\.\.\.|…|\w+|[^\w\s]", text, flags=re.UNICODE)
+
+    def _wordpiece_tokenize(self, text: str) -> List[str]:
+        base = re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+        if not self.token2id:
+            return base
+        vocab = self.token2id
+        out: List[str] = []
+        for tok in base:
+            if tok in vocab:
+                out.append(tok)
+                continue
+            if not tok.isalpha():
+                out.append(tok)
+                continue
+            sub = []
+            i = 0
+            while i < len(tok):
+                j = len(tok)
+                piece = None
+                while j > i:
+                    cand = tok[i:j] if i == 0 else (self._wp_prefix + tok[i:j])
+                    if cand in vocab:
+                        piece = cand
+                        break
+                    j -= 1
+                if piece is None:
+                    out.append(self.unk_token)
+                    break
+                sub.append(piece)
+                i = j
+            else:
+                out.extend(sub)
+        return out
 
     def _extract_texts_from_line(self, raw: str) -> Iterable[str]:
         """
@@ -200,5 +294,8 @@ tokenizer = SimpleTokenizer(
     max_vocab_size=30000,
     max_files=None,
     max_lines_per_file=200000,
-    lowercase=True
+    lowercase=True,
+    use_wordpiece=False,
+    merge_wordpieces_on_decode=True,
+    normalize_unicode=True
 )

@@ -3,8 +3,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Dict, Any, Optional, Tuple
+# import numpy as np
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 import math
 
@@ -511,7 +511,7 @@ def optimize_model_for_fp8(model: nn.Module, config: FP8Config = None) -> nn.Mod
     
     replace_linear(model)
     
-    print(f"FP8-optimized model (RTX 4000 series)")
+    print("FP8-optimized model (RTX 4000 series)")
     print(f"   FP8 available: {HAS_FP8}")
     print(f"   Mode: {'FP8 native' if HAS_FP8 else 'FP16 fallback'}")
     

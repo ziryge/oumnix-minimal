@@ -1,4 +1,6 @@
 import gradio as gr
+from utils.logging_utils import get_logger
+logger = get_logger("advanced_web")
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
@@ -14,6 +16,7 @@ class AdvancedWebInterface:
         self.conversation_history = []
         self.performance_history = []
         self.neuro_history = []
+        self.op_status = "Idle"
         
         self.update_interval = 5  
         self.max_history_points = 100
@@ -42,15 +45,25 @@ class AdvancedWebInterface:
         confidence = response.get('confidence', 0.0)
         processing_time = response.get('processing_time', 0.0)
         reasoning = response.get('reasoning_program', [])
-        
-        analysis = f"""
-        """
+        steps = reasoning if isinstance(reasoning, list) else [reasoning]
+        steps = [str(s) for s in steps[:3] if s]
+        bar = int(max(0.0, min(1.0, confidence)) * 20)
+        bar_str = '█' * bar + '░' * (20 - bar)
+        analysis = (
+            f"Confidence: {bar_str} {confidence:.2f}\n"
+            f"Processing time: {processing_time:.3f}s\n" + ("\n".join(f"Step {i+1}: {st}" for i, st in enumerate(steps)))
+        )
         return analysis
     
     def get_system_status(self) -> str:
         status = self.ai.get_system_status()
-        status_text = f"""
-        """
+        m = status.get('memory_stats', {})
+        threads = status.get('background_threads', 0)
+        params = status.get('model_params', 0)
+        status_text = (
+            f"Params: {params} | Device: {status.get('device')} | Threads: {threads}\n"
+            f"Memory: warm_windows={m.get('warm_windows',0)} tokens={m.get('total_tokens',0)}"
+        )
         return status_text
     
     def get_neuro_state(self) -> Tuple[str, go.Figure]:
@@ -62,8 +75,7 @@ class AdvancedWebInterface:
         modulated = analysis.get('modulated_params', {})
         mood = analysis.get('interpreted_mood', 'neutral')
         
-        state_text = f"""
-        """
+        state_text = f"Mood: {mood}\nDopamine: {current.get('dopamine',0.5):.2f} | Serotonin: {current.get('serotonin',0.5):.2f}\nNoradrenaline: {current.get('noradrenaline',0.5):.2f} | ACh: {current.get('acetylcholine',0.5):.2f}"
         
         neurotransmitters = ['Dopamine', 'Serotonin', 'Noradrenaline', 'Acetylcholine']
         values = [
@@ -107,8 +119,11 @@ class AdvancedWebInterface:
     def get_memory_stats(self) -> Tuple[str, go.Figure]:
         memory_stats = self.ai.memory_system.get_stats()
         
-        stats_text = f"""
-        """
+        stats = self.ai.memory_system.get_stats()
+        stats_text = (
+            f"Hot hits: {stats.get('hot_hits',0)} | Warm windows: {stats.get('warm_windows',0)} | Teleport calls: {stats.get('teleport_calls',0)}\n"
+            f"Compression: {stats.get('compression_ratio',0.0):.3f} | Total tokens: {stats.get('total_tokens',0)}"
+        )
         
         labels = ['Hot Cache', 'Warm Cache', 'Cold Cache']
         values = [
@@ -219,11 +234,16 @@ class AdvancedWebInterface:
         return "Consolidation successfully started!"
     
     def save_state(self) -> str:
-        try:
-            self.ai.save_state()
-            return "State successfully saved!"
-        except Exception as e:
-            return f"Error while saving: {e}"
+        import threading
+        def _save():
+            self.op_status = "Saving..."
+            try:
+                self.ai.save_state()
+                self.op_status = "Save complete"
+            except Exception as e:  # pragma: no cover
+                self.op_status = f"Save error: {e}"
+        threading.Thread(target=_save, daemon=True).start()
+        return "Save started"
     
     def reset_neurochemistry(self) -> str:
         if self.ai.neurochemistry:
@@ -292,12 +312,14 @@ class AdvancedWebInterface:
                                 refresh_btn = gr.Button("Refresh", variant="secondary")
                                 consolidate_btn = gr.Button("Consolidate", variant="primary")
                                 save_btn = gr.Button("Save", variant="primary")
+                                load_btn = gr.Button("Load", variant="secondary")
                         
                         with gr.Column():
                             performance_chart = gr.Plot(
                                 label="Performance",
                                 value=self.get_performance_chart()
                             )
+                            op_status_box = gr.Markdown(value=self.op_status, label="Op Status")
                     
                     refresh_btn.click(
                         self.get_system_status,
@@ -309,10 +331,22 @@ class AdvancedWebInterface:
                         outputs=[gr.Textbox(visible=False)]  
                     )
                     
-                    save_btn.click(
-                        self.save_state,
-                        outputs=[gr.Textbox(visible=False)]  
-                    )
+                    def _save_and_status():
+                        msg = self.save_state()
+                        return msg, self.op_status
+                    save_btn.click(_save_and_status, outputs=[gr.Textbox(visible=False), op_status_box])
+                    def _load_and_status():
+                        import threading
+                        self.op_status = "Loading..."
+                        def _load():
+                            try:
+                                ok = self.ai.load_state()
+                                self.op_status = "Load complete" if ok else "Load failed"
+                            except Exception as e:  # pragma: no cover
+                                self.op_status = f"Load error: {e}"
+                        threading.Thread(target=_load, daemon=True).start()
+                        return "Load started", self.op_status
+                    load_btn.click(_load_and_status, outputs=[gr.Textbox(visible=False), op_status_box])
                 
                 with gr.TabItem("Neurochemistry"):
                     with gr.Row():
@@ -388,8 +422,8 @@ def start_advanced_web(ai_instance, port: int = 7860, share: bool = False):
     web_interface = AdvancedWebInterface(ai_instance)
     interface = web_interface.create_interface()
     
-    print(f"Starting web interface on port {port}")
-    print(f"   URL: http://localhost:{port}")
+    logger.info(f"Starting web interface on port {port}")
+    logger.info(f"   URL: http://localhost:{port}")
     
     interface.launch(
         server_port=port,

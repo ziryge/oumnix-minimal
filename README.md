@@ -1,5 +1,10 @@
 # Oumnix AI – Proprietary Non‑Transformer Architecture
 
+[![CI](https://img.shields.io/github/actions/workflow/status/qrv0/oumnix-minimal/ci.yml?branch=main&label=CI)](https://github.com/qrv0/oumnix-minimal/actions)
+[![codecov](https://codecov.io/gh/qrv0/oumnix-minimal/branch/main/graph/badge.svg)](https://codecov.io/gh/qrv0/oumnix-minimal)
+[![Style](https://img.shields.io/badge/style-ruff%2Fblack-blue.svg)](#)
+
+
 [![License](https://img.shields.io/badge/license-BSL--1.1-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.3%2B-orange.svg)](https://pytorch.org)
@@ -12,6 +17,8 @@
 [![YouTube](https://img.shields.io/badge/YouTube-Demo-red.svg)](https://www.youtube.com/watch?v=pOzOnSE1IAY)
 
 A generative AI architecture that is an alternative to Transformers, focused on efficiency, long‑term memory, and dynamic reasoning. This repository contains the full agent (CLI and Web), training pipelines (with a recommendation to use streaming training), and the memory, metacognition, and neurochemistry components.
+
+See also: ARCHITECTURE.md for deep technical reference (shapes, masks, error contracts, performance).
 
 Key architectural features
 - Mixture‑of‑Operators per token: blends local/global attention, SSM, and convolution per time step.
@@ -36,6 +43,52 @@ Mixed precision and FP8
 
 
 ## Editions
+
+Advanced knobs and usage (flag-gated)
+- Per-token operator mixing (MoOp) and regularization:
+  - Python: `model = OumnixSimpleAI(vocab_size, use_moop=True, moop_temperature=0.8, moop_entropy_reg=0.0)`
+- RAG-fused attention in LocalGlobalAttention:
+  - Provider must return a tensor `[B, K, C]` (embedding space). Example:
+    ```python
+    from utils.rag_provider import SimpleRagProvider
+    model = OumnixSimpleAI(vocab_size)
+    rag = SimpleRagProvider(dim=model.embed.embedding_dim, topk=8)
+    for layer in model.layers:
+        att = layer[0]
+        if hasattr(att, 'set_rag_provider'):
+            att.use_rag = True
+            att.set_rag_provider(lambda x: rag(x))
+    ```
+- Early exit:
+  - `model = OumnixSimpleAI(vocab_size, early_exit=True, exit_threshold=1.0)`
+- WEAVE wrappers (selected Linear layers):
+  - `model = OumnixSimpleAI(vocab_size, use_weave=True)`
+- Islet Injection (minimal LRU path):
+  - `model = OumnixSimpleAI(vocab_size, use_islet_injection=True, islet_capacity=128)`
+- Oumnix Cell v1 (branch + collapse):
+  - `model = OumnixSimpleAI(vocab_size, use_cell=True, cell_threshold=0.5)`
+- Auxiliary heads scaffold (temporal/identity):
+  - `model = OumnixSimpleAI(vocab_size, use_aux_heads=True)`
+- Bayesian Residuals (state uncertainty):
+  - `model = OumnixSimpleAI(vocab_size, use_bayesian_residuals=True, residual_std=0.02)`
+- Token Flow (no-KV light):
+  - In LocalGlobalAttention: `enable_token_flow=True, token_flow_thresh=0.6`
+- CLI env controls:
+  - `OUMNIX_TEMPERATURE`, `OUMNIX_TOPK`, `OUMNIX_MAX_NEW_TOKENS`, `OUMNIX_USE_RAG` ("1" to enable rolling RAG)
+- Web interface factory and optional controls:
+  - `make_interface(temperature=None, top_k=50, max_new_tokens=16)`
+  - `OUMNIX_WEB_CONTROLS=1` to enable sliders (temperature, top-k, max_new_tokens)
+  - sliders persist to `.oumnix_web_settings.json` when controls UI is enabled
+- Logging controls:
+  - `OUMNIX_LOG_LEVEL` to set logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+
+
+Note: This Simple Edition now includes flag-gated knobs for research:
+- Optional per-token operator mixing (MoOp) in OumnixSimpleAI via use_moop=True.
+- Optional RAG-fused attention in LocalGlobalAttention via use_rag and set_rag_provider (provider returns a [B, K, C] tensor to be projected into K/V pseudo-tokens).
+- CLI environment controls: OUMNIX_TEMPERATURE, OUMNIX_TOPK, OUMNIX_MAX_NEW_TOKENS, OUMNIX_USE_RAG ("1"), OUMNIX_STOP_SEQUENCES (comma-separated), OUMNIX_METRICS_INTERVAL (int).
+- Web factory: make_interface(temperature=None, top_k=50, max_new_tokens=16).
+
 
 ### Simple Edition (Open Source)
 This repository. Includes core Oumnix features such as modular operators, Infinity-Window memory, adaptive parameter control, and basic metacognition. Designed for research accessibility and consumer GPUs.
@@ -76,8 +129,92 @@ While others aim to replace attention or compress memory,
 Oumnix explores neuro-inspired modularity, infinite-context memory, and operator-level adaptivity.
 
 
-## Architecture Overview (ASCII)
+## Architecture Overview (ASCII + Mermaid)
 
+```mermaid
+flowchart LR
+  IDS[Token IDs] -->|embed| X[BxNxC]
+  X --> A[LocalGlobalAttention]
+  PROVIDER[[RAG Provider]] -- mem[B,K,C] --> A
+  A --> AOUT[BxNxC]
+  X --> S[SSMBlock]
+  S --> SOUT[BxNxC]
+  X --> C[DepthwiseConv1d]
+  C --> COUT[BxNxC]
+  X --> M[TokenOperatorMixer]
+  M --> W[Weights BxNx3]
+  AOUT --> MIX
+  SOUT --> MIX
+  COUT --> MIX
+  W --> MIX
+  MIX[MoOp Mixer] --> XPRIME[BxNxC]
+  XPRIME --> CELL{use_cell?}
+  CELL -- yes --> BR[Branch MLP] --> GATE[Verifier Gate] --> XG[BxNxC]
+  CELL -- no --> XNOR[X]
+  XG --> RES[Bayesian Residuals]
+  XNOR --> RES
+  RES --> ISLET{islet?}
+  ISLET -- yes --> INJ[LRU inject last token]
+  ISLET -- no --> ID1[ ]
+  INJ --> EXIT{early_exit?}
+  ID1 --> EXIT
+  EXIT -- no --> HEAD[LM Head]
+  EXIT -- yes --> HEAD
+  HEAD --> LOGITS[BxNxV]
+```
+
+### Attention masking (Mermaid)
+
+```mermaid
+sequenceDiagram
+  participant QKV as Q/K/V
+  participant Scores as scores
+  participant Mask as Masks
+  QKV->>Scores: scores = q @ k^T * scale
+  Mask->>Scores: apply causal (tri), attention (pad), band (|i-j|  W)
+  Scores->>Scores: softmax  attn_local
+  Note over Scores: Global path uses subsampled k (stride=W) with shape-aligned mask
+```
+
+
+
+```
+                         +----------------------------------+
+                         |          OumnixAI Wrapper        |
+                         |  - Metacognition (basic)         |
+                         |  - Neurochemistry modulation     |
+User Text ──tokenize──▶  |  - Infinity-Window integration   |
+                         +---------┬------------------------+
+                                   | memory_vectors (RAG)
+                                   v
++--------------------------------------------------------------------+
+|                    OumnixMinimal (Simple Edition)                  |
+|                                                                    |
+|  Token Embedding + Positional Embedding                            |
+|           │                                                        |
+|           v                                                        |
+|  ┌──────────────────────────────────────────────────────────────┐  |
+|  |                OumnixMinimalBlock (repeated N)               |  |
+|  |                                                              |  |
+|  |  LayerNorm → TokenOperatorMixer (MoOp, flag)                 |  |
+|  |            │                     │                           |  |
+|  |            │                     ├─ Local/Global Attention   |  |
+|  |            │                     │    (RAG via provider)     |  |
+|  |            │                     │    (TokenFlow, flag)      |  |
+|  |            └─────────────────────┤                           |  |
+|  |                                  └─ SSM (state space block)  |  |
+|  |                                                              |  |
+|  |  Residual add → LayerNorm                                    |  |
+|  |  Early-exit by entropy (flag)                                |  |
+|  └──────────────────────────────────────────────────────────────┘  |
+|           │                                                        |
+|           v                                                        |
+|        LayerNorm  →  LM Head  →  logits                            |
++--------------------------------------------------------------------+
+
+Infinity‑Window Memory:
+  - Hot‑KV (VRAM), Warm‑KV (RAM, PQ+Low‑Rank), context tree + teleport.
+  - RAG provider returns [B, K, C] memory vectors, projected into K/V.      
 ```
                            +----------------------------------+
                            |          OumnixAI Wrapper        |
@@ -124,6 +261,37 @@ Infinity‑Window Memory (outside core):
 ```
 
 
+### Cell branch and verifier (Mermaid)
+
+```mermaid
+flowchart LR
+  X[X (from mixer)] --> BR[Branch MLP]
+  BR --> V[Verifier (sigmoid(mean))]
+  V --> TH{score > threshold?}
+  TH -- yes --> G1[Gate=1]
+  TH -- no --> G0[Gate=0]
+  A[Attention path A] --> SUM
+  S[SSM path S] --> SUM
+  C[Conv path C] --> SUM
+  SUM[Mix: x + w0*A + w1*S + w2*C] --> COMB
+  G1 -->|branch added| COMB
+  G0 -->|branch suppressed| COMB
+  COMB --> OUT[X']
+```
+
+### Weave + LoRA projections (Mermaid)
+
+```mermaid
+flowchart LR
+  X[x] --> BASE[Linear]
+  X --> LORA_A[LoRA A]
+  LORA_A --> LORA_B[LoRA B]
+  BASE --> SUM
+  LORA_B --> SUM
+  SUM[base(x) + x@A@B * alpha/r] --> GATE[sigmoid(g)]
+  GATE --> Y[y]:::proj
+  classDef proj fill:#eef,stroke:#66f;
+```
 
 ## Beginners (Quickstart)
 
@@ -177,11 +345,41 @@ python train_streaming.py --enable_neurochem
 - Place your files in `datasets/` (accepted: .json, .jsonl, .txt)
 - The reader supports JSON lines with keys `text` or `content`, lists, or conversation format under `conversations: [{role, content}]`.
 
+5) Determinism
+- Set `OUMNIX_DETERMINISTIC=1` to enable deterministic seeds in CLI/Web and training.
+- Seeds are propagated to NumPy/Torch; PQ (FAISS KMeans) uses a fixed seed. GPU kernels may still differ slightly between runs.
 
-#Advanced Users and Labs (controls)
+6) Persistence flags
+- `--save-full-state` / `--resume-full-state` and `--state-dir` / `--state-password` are available in `train.py` and `train_streaming.py`.
+- Full state includes model weights and memory summaries; LifeFile supports password rotation and backups (`.ai_state/ai_state.life`).
+
+
+## Advanced Users and Labs (controls)
 
 
 A) Full agent runtime (main.py)
+
+Snippets
+- Enable MoOp with 3 operators and regularization:
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_moop=True, moop_temperature=0.8)`
+- Enable WEAVE on LoRA-wrapped projections:
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_weave=True)`
+- Enable Bayesian Residuals (deterministic) and stochastic variant:
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_bayesian_residuals=True, residual_std=0.02)`
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_bayesian_residuals=True, residual_std=0.02, residual_stochastic=True, residual_prob=0.5)`
+- Enable Islet Injection with small LRU cache:
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_islet_injection=True, islet_capacity=128)`
+- Oumnix Cell v1 scaffold:
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_cell=True, cell_threshold=0.5)`
+- Auxiliary heads scaffold:
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, use_aux_heads=True)`
+- Token Flow and early exit:
+  `attn = LocalGlobalAttention(dim=64, heads=4, local_window=8, enable_token_flow=True, token_flow_thresh=0.6)`
+  `model = OumnixSimpleAI(vocab_size=tokenizer.vocab_size, early_exit=True, exit_threshold=0.8)`
+- Web controls with persistence enabled:
+  `OUMNIX_WEB_CONTROLS=1 python main.py --ui web`
+- CLI stop sequences and throughput logging:
+  `OUMNIX_STOP_SEQUENCES="\nEND,\nSTOP" OUMNIX_METRICS_INTERVAL=10 python main.py --ui cli`
 Flags:
 - `--ui [cli|web]` – UI. Default: `cli`.
 - `--model-dim INT` – Model dimensionality. Default: 768.
@@ -281,10 +479,47 @@ F) Checkpoints and state
 - `main.py` tries to auto‑discover checkpoints under: `checkpoints_streaming/`, `checkpoints/` (legacy `checkpo/` is still scanned).
 - Complete state (model + memory + metacognition + neuro + config) is saved/restored via `PersistenceManager` and `--load-state`/`--state-dir`.
 
-G) Performance and VRAM
+Episodic memory persistence
+- The agent’s FAISS‑backed episodic memory is serialized inside the LifeFile as separate segments:
+  - `episodic_meta` (JSON): dimension, normalization flag, metric (L2/IP), whether vectors are stored, and texts.
+  - `episodic_vectors` (NumPy): stacked float32 vectors when `store_vectors=True`.
+- On load, the vectors are re‑added to a fresh FAISS index using the stored meta. When `store_vectors=False`, only texts are restored.
+
+G) Performance and VRAM (with live counters examples)
 - Prefer `train_streaming.py` for large datasets and limited VRAM.
 - Use `--use_amp` to reduce overhead; on RTX 4000 consider `--use_fp8` (or rely on automatic detection).
 - Adjust `--chunk_size`, `--max_length`, and `--batch_size` based on your constraints.
+- Trainers log performance metrics: tokens/s, ms/token, and VRAM usage snapshots.
+- CLI can log generation throughput via `OUMNIX_METRICS_INTERVAL` (tokens per interval).
+
+Live plotting example (Plotly):
+```python
+from utils.metrics import PerfTracker
+import plotly.graph_objects as go
+
+perf = PerfTracker(window=100)
+# Simulate updates
+data_tps, data_ms = [], []
+for step in range(1, 501):
+    tokens = 4096  # example tokens produced per interval
+    seconds = 0.5  # example interval seconds
+    perf.update(tokens, seconds)
+    snap = perf.snapshot()
+    data_tps.append(snap['tokens_per_sec'])
+    data_ms.append(snap['ms_per_token'])
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(y=data_tps, mode='lines', name='tokens/s'))
+fig.add_trace(go.Scatter(y=data_ms, mode='lines', name='ms/token', yaxis='y2'))
+fig.update_layout(
+    title='Oumnix – Live Perf Counters',
+    xaxis_title='Interval',
+    yaxis=dict(title='tokens/s'),
+    yaxis2=dict(title='ms/token', overlaying='y', side='right'),
+)
+fig.show()
+```
+
 
 H) Code layout (main folders)
 - `core/`: minimal model (OumnixMinimal), AI wrapper, metacognition, loss, FP8 optimization.
@@ -297,16 +532,25 @@ I) Notices and limits
 - Some advanced mechanisms (Islet Injection, dynamic depth, Oumnix Cell collapse) are sensitive during training; Islet Injection is disabled by default while training.
 - Embedded RAG depends on FAISS (CPU by default – see `requirements.txt`).
 
+J) OMNX Exporter (metrics)
+- Enable with `OUMNIX_OMNX=1` and optional `OUMNIX_OMNX_PORT`. Trainers expose tokens/s, ms/token, KV-hit and head-drop via `/metrics`.
+- Example: `OUMNIX_OMNX=1 python train.py --use_amp` then scrape `http://localhost:9100/metrics`.
+
+K) Infinity-Window Persistence Notes
+- Warm windows are compressed using PQ (codebooks) and Low-Rank (SVD) with reconstruction error tracked per window.
+- Metadata tracked includes `last_access`, `importance`, `compression_ratio`, and `recon_error` for eviction and diagnostics.
 
 
 ## License
 
-
 This project uses the Business Source License 1.1 (BSL 1.1). See `LICENSE` for full terms. Licensor: qrv0. Change Date: 2028. The final open license (Change License) will be defined by the Licensor by the Change Date.
-
 
 
 ## Credits
 
 - Author: qrv0
-- Acknowledgments: the open‑source community and projects that inspired Mixture‑of‑Operators, SSM, and long‑term memory ideas.
+
+## Security & Secrets
+
+- Set `OUMNIX_STATE_PASSWORD` and optionally `OUMNIX_STATE_SALT` in your environment to control LifeFile encryption.
+- Password rotation is supported via PersistenceManager (also integrated in the agent and trainers). Salt defaults to a built‑in value if not provided; prefer setting your own salt in production.

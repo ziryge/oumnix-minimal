@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+from utils.seeds import set_seed
+from utils.logging_utils import get_logger
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -65,6 +67,8 @@ def collate_fn(batch):
     return ids, ids  
 
 def create_model(args):
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')
     if USE_ADVANCED_MODEL:
         print("[INFO] Creating advanced model...")
         config = OumnixAIConfig(
@@ -137,6 +141,7 @@ def train_epoch(model, dataloader, optimizer, scaler, device, epoch, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Simplified Oumnix AI Training")
+    parser.add_argument('--deterministic', action='store_true', help='Enable deterministic mode')
     
     parser.add_argument('--epochs', type=int, default=2, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
@@ -151,27 +156,29 @@ def main():
     
     args = parser.parse_args()
     
-    print("Simplified Oumnix Agent Training")
-    print("=" * 50)
+    logger = get_logger("train_simple")
+    set_seed(1337, deterministic=args.deterministic)
+    logger.info("Simplified Oumnix Agent Training")
+    logger.info("=" * 50)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
+    logger.info(f"Device: {device}")
     
     if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
     
     # Load dataset
     try:
         dataset = TextLineDataset(dataset_dir="datasets")
-        print(f"Dataset: {len(dataset)} samples")
+        logger.info(f"Dataset: {len(dataset)} samples")
         
         if args.max_samples and len(dataset) > args.max_samples:
             dataset.samples = dataset.samples[:args.max_samples]
-            print(f"Dataset limited to {len(dataset)} samples (max_samples)")
+            logger.info(f"Dataset limited to {len(dataset)} samples (max_samples)")
         
         if len(dataset) == 0:
-            print("[FAIL] Empty dataset! Add files to datasets/")
+            logger.error("Empty dataset! Add files to datasets/")
             return
         
         dataloader = DataLoader(
@@ -192,7 +199,7 @@ def main():
         model = model.to(device)
         
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Parameters: {total_params/1e6:.1f}M")
+        logger.info(f"Parameters: {total_params/1e6:.1f}M")
         
     except Exception as e:
         print(f"[FAIL] Model creation error: {e}")
@@ -200,16 +207,28 @@ def main():
         traceback.print_exc()
         return
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.endswith('.bias') or 'norm' in n.lower() or 'layernorm' in n.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    param_groups = [
+        {"params": decay, "weight_decay": 0.01},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
     scaler = GradScaler() if args.use_amp else None
     
     os.makedirs(args.out_dir, exist_ok=True)
     
-    print("Starting training...")
-    print(f"Epochs: {args.epochs}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Mixed precision: {args.use_amp}")
-    print("-" * 50)
+    logger.info("Starting training...")
+    logger.info(f"Epochs: {args.epochs}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Mixed precision: {args.use_amp}")
+    logger.info("-" * 50)
     
     best_loss = float('inf')
     
@@ -220,9 +239,9 @@ def main():
             avg_loss = train_epoch(model, dataloader, optimizer, scaler, device, epoch, args)
             
             epoch_time = time.time() - start_time
-            print(f"\nEpoch {epoch} completed:")
-            print(f"  Loss: {avg_loss:.4f}")
-            print(f"  Time: {epoch_time:.1f}s")
+            logger.info(f"Epoch {epoch} completed:")
+            logger.info(f"  Loss: {avg_loss:.4f}")
+            logger.info(f"  Time: {epoch_time:.1f}s")
             
             checkpoint = {
                 'epoch': epoch,
@@ -233,16 +252,20 @@ def main():
             }
             
             ckpt_path = os.path.join(args.out_dir, f"checkpoint_epoch_{epoch}.pt")
-            torch.save(checkpoint, ckpt_path)
-            print(f"  Checkpoint saved: {ckpt_path}")
+            tmp_ckpt = ckpt_path + ".tmp"
+            torch.save(checkpoint, tmp_ckpt)
+            os.replace(tmp_ckpt, ckpt_path)
+            logger.info(f"  Checkpoint saved: {ckpt_path}")
             
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 best_path = os.path.join(args.out_dir, "best_model.pt")
-                torch.save(checkpoint, best_path)
-                print(f"  New best model: {best_path}")
+                tmp_best = best_path + ".tmp"
+                torch.save(checkpoint, tmp_best)
+                os.replace(tmp_best, best_path)
+                logger.info(f"  New best model: {best_path}")
             
-            print("-" * 50)
+            logger.info("-" * 50)
             
         except Exception as e:
             print(f"[FAIL] Error in epoch {epoch}: {e}")
@@ -250,9 +273,9 @@ def main():
             traceback.print_exc()
             break
     
-    print("Training finished")
-    print(f"Best loss: {best_loss:.4f}")
-    print(f"Checkpoints saved in: {args.out_dir}")
+    logger.info("Training finished")
+    logger.info(f"Best loss: {best_loss:.4f}")
+    logger.info(f"Checkpoints saved in: {args.out_dir}")
 
 if __name__ == "__main__":
     main()
