@@ -262,7 +262,3 @@ Oumnix represents a viable, powerful, and theoretically grounded direction for t
 31. Large Language Model Evaluation in 2025: 10+ Metrics & Methods \- Research AIMultiple, accessed August 26, 2025, [https://research.aimultiple.com/large-language-model-evaluation/](https://research.aimultiple.com/large-language-model-evaluation/) 1  
 32. LongGenBench: Benchmarking Long-Form Generation in Long Context LLMs | OpenReview, accessed August 26, 2025, [https://openreview.net/forum?id=3A71qNKWAS](https://openreview.net/forum?id=3A71qNKWAS) 1  
 33. Chapter 11 Resources and Benchmarks for NLP | Modern Approaches in Natural Language Processing \- GitHub Pages, accessed August 26, 2025, [https://slds-lmu.github.io/seminar\_nlp\_ss20/resources-and-benchmarks-for-nlp.html](https://slds-lmu.github.io/seminar_nlp_ss20/resources-and-benchmarks-for-nlp.html) 1
-
-#### **Referências citadas**
-
-1. Validação Científica da Arquitetura Oumnix.txt
